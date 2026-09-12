@@ -24,9 +24,9 @@ from gladiator.service_ext import ExtendedGladiatorService
 from gladiator.telegram.bot import IncomingTask
 
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_MODEL = "thinkingmachines/inkling:free"
+DEFAULT_MODEL = "dots-studio/dots-3-note-preview:free"
 FINAL_PREFIX = "IMAGE_DESCRIPTION:"
-OUTPUT_NAME = "inkling_square.png"
+OUTPUT_NAME = "gladiator_square.png"
 
 
 def required_env(name: str) -> str:
@@ -95,13 +95,12 @@ async def run_provider_preflight(*, api_key: str, base_url: str, model: str) -> 
             include_image=include_image,
             app_attribution=app_attribution,
         )
-        print(f"INKLING_PREFLIGHT {name} status={status} body={body}")
+        print(f"MODEL_PREFLIGHT {name} status={status} body={body}")
         if status >= 400:
             failures.append(f"{name}: HTTP {status}: {body[:1200]}")
 
-    # The attributed multimodal probe is the capability we actually need for this E2E.
     if any(item.startswith("image_tools_attributed:") for item in failures):
-        raise RuntimeError("Inkling multimodal preflight failed: " + " | ".join(failures))
+        raise RuntimeError("Multimodal provider preflight failed: " + " | ".join(failures))
 
 
 async def drain_pending_updates(service: ExtendedGladiatorService) -> int | None:
@@ -155,8 +154,6 @@ async def main() -> None:
     base_url = os.environ.get("E2E_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
     model = os.environ.get("E2E_MODEL", DEFAULT_MODEL)
 
-    # Fail before asking the user for another image if this account/model route rejects
-    # agentic or multimodal requests. The synthetic image contains no user data.
     await run_provider_preflight(api_key=api_key, base_url=base_url, model=model)
 
     workspace = Path(tempfile.mkdtemp(prefix="gladiator-image-e2e-"))
@@ -208,8 +205,8 @@ async def main() -> None:
             user_id,
             "<b>Gladiator image E2E is ready.</b>\n"
             "Send one NEW non-sensitive photo or image file now.\n\n"
-            "The test will use the free Inkling multimodal endpoint to describe it, crop the largest centered square, "
-            "verify the crop dimensions, and send the square image back. Please avoid confidential images or identifiable faces for this free-endpoint test.",
+            f"The test will use <code>{model}</code> to describe it, crop the largest centered square, "
+            "verify the crop dimensions, and send the square image back.",
         )
 
         incoming = await wait_for_new_image(service, user_id=user_id, offset=offset)
@@ -233,7 +230,7 @@ async def main() -> None:
         await service.handle_task(user_id, task)
 
         if not final_outputs or not final_outputs[-1].lstrip().startswith(FINAL_PREFIX):
-            raise RuntimeError("Inkling did not return the required image-description final response")
+            raise RuntimeError("Model did not return the required image-description final response")
         if not output_path.exists():
             raise RuntimeError("Agent did not create the expected square crop")
         with Image.open(output_path) as cropped:
