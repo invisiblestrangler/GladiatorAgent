@@ -60,13 +60,29 @@ async def run_once(*, api_key: str, bot_token: str, user_id: int, attempt: int) 
     service.agent.config.step_limit = 12
     service.agent.config.wall_time_limit_seconds = 180
     final_outputs: list[str] = []
+    draft_calls = 0
+    edit_calls = 0
     original_send_markdown = service._send_markdown
+    original_send_message_draft = service.bot.client.send_message_draft
+    original_edit_message_text = service.bot.client.edit_message_text
 
     async def capture_and_send_markdown(chat_id: int, text: str) -> None:
         final_outputs.append(text)
         await original_send_markdown(chat_id, text)
 
+    async def count_draft(*args, **kwargs):
+        nonlocal draft_calls
+        draft_calls += 1
+        return await original_send_message_draft(*args, **kwargs)
+
+    async def count_edit(*args, **kwargs):
+        nonlocal edit_calls
+        edit_calls += 1
+        return await original_edit_message_text(*args, **kwargs)
+
     service._send_markdown = capture_and_send_markdown  # type: ignore[method-assign]
+    service.bot.client.send_message_draft = count_draft  # type: ignore[method-assign]
+    service.bot.client.edit_message_text = count_edit  # type: ignore[method-assign]
 
     try:
         identity = await service.bot.client._call("getMe")
@@ -94,6 +110,10 @@ async def run_once(*, api_key: str, bot_token: str, user_id: int, attempt: int) 
         )
         await service.handle_task(user_id, task)
 
+        if draft_calls != 1:
+            raise RuntimeError(f"Progress draft was sent {draft_calls} times; expected exactly one static Stop-control draft")
+        if edit_calls < 1:
+            raise RuntimeError("Persistent Telegram progress message was never edited in place")
         if not final_outputs or final_outputs[-1].strip() != FINAL_SENTINEL:
             raise RuntimeError("Agent final submission did not match the expected E2E sentinel")
         probe = workspace / "e2e_probe.txt"
@@ -117,7 +137,7 @@ async def run_once(*, api_key: str, bot_token: str, user_id: int, attempt: int) 
 
         await service.bot.client.send_message(
             user_id,
-            "<b>Gladiator E2E PASS</b>\nTelegram ✓\nModel stream ✓\nFinal submission ✓\nBash tool loop ✓\nTODO ledger ✓\n/new archive + reset ✓",
+            "<b>Gladiator E2E PASS</b>\nTelegram ✓\nStable progress edits ✓\nSingle Stop draft ✓\nModel stream ✓\nFinal submission ✓\nBash tool loop ✓\nTODO ledger ✓\n/new archive + reset ✓",
         )
     finally:
         await service.bot.client.close()
