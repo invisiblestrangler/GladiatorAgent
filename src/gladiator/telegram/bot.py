@@ -69,6 +69,21 @@ class TelegramBotRuntime:
             await self.client.close()
 
     async def _handle_update(self, update: dict) -> None:
+        callback = update.get("callback_query")
+        if isinstance(callback, dict):
+            callback_id = str(callback.get("id") or "")
+            data = str(callback.get("data") or "")
+            message = callback.get("message") or {}
+            chat = message.get("chat") or {}
+            chat_id = chat.get("id")
+            if isinstance(chat_id, int) and self._authorized(chat_id) and data == "gladiator:stop":
+                await self.on_stop(chat_id)
+                if callback_id:
+                    await self.client.answer_callback_query(callback_id, "Stop requested.")
+            elif callback_id:
+                await self.client.answer_callback_query(callback_id)
+            return
+
         stopped = update.get("stopped_message_generation")
         if isinstance(stopped, dict):
             chat = stopped.get("chat") or {}
