@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 
 from gladiator.events import AgentEvent, EventKind, EventSink, null_event_sink
@@ -15,6 +14,8 @@ SYSTEM_TEMPLATE = GLADIATOR_RUNTIME_POLICY + r"""
 You can interact with the computer through the bash tool. Work autonomously until the user's task is complete.
 Use targeted inspection rather than dumping large files. Execute one focused action at a time and verify changes with tests.
 For lightweight public-web research, use `gladiator web search QUERY` and `gladiator web fetch URL` as sole bash commands. Prefer these over browser automation.
+User-created skills are lazy external memory. Use `gladiator skill list` to see names and `gladiator skill read NAME` only when a listed skill is relevant. Never read all skills by default.
+Only when the CURRENT user request explicitly asks you to create or change a skill may you write a skill: first create a SKILL.md candidate in the workspace, then call `gladiator skill write NAME PATH` as the sole bash command. The runtime enforces this permission.
 To send a generated image or file to the user, call bash with `gladiator send PATH` as the sole command.
 If and ONLY if you are exceptionally uncertain about a materially consequential choice after investigating, you may ask the user with a sole bash command of this form:
 `gladiator ask --question '...' --option 'choice A' --option 'choice B' --conservative 'choice A' --reason 'why this cannot be resolved safely'`

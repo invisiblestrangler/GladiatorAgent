@@ -7,6 +7,7 @@ from typing import Callable
 from gladiator.events import AgentEvent, EventKind, EventSink, null_event_sink
 from gladiator.runtime.context import ObservationLimiter
 from gladiator.runtime.decision import DecisionRequest, DecisionResult
+from gladiator.skills import SkillManager
 from gladiator.webtools import WebTools
 from minisweagent.environments.local import LocalEnvironment
 
@@ -24,6 +25,7 @@ class GladiatorLocalEnvironment(LocalEnvironment):
         event_sink: EventSink = null_event_sink,
         decision_handler: DecisionHandler | None = None,
         web_tools: WebTools | None = None,
+        skill_manager: SkillManager | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -32,6 +34,8 @@ class GladiatorLocalEnvironment(LocalEnvironment):
         self.workspace_root = workspace_root.resolve()
         self.decision_handler = decision_handler
         self.web_tools = web_tools
+        self.skill_manager = skill_manager
+        self.skill_write_authorized = False
 
     def execute(self, action: dict, cwd: str = "", *, timeout: int | None = None) -> dict:
         command = str(action.get("command", ""))
@@ -39,6 +43,7 @@ class GladiatorLocalEnvironment(LocalEnvironment):
             self._artifact_command(command, cwd=cwd)
             or self._decision_command(command)
             or self._web_command(command)
+            or self._skill_command(command, cwd=cwd)
         )
         if special is not None:
             return special
@@ -175,6 +180,63 @@ class GladiatorLocalEnvironment(LocalEnvironment):
                 }
         except Exception as exc:
             return {"output": f"Web operation failed: {exc}", "returncode": 1, "exception_info": type(exc).__name__}
+        return {"output": output, "returncode": 0, "exception_info": ""}
+
+    def _skill_command(self, command: str, *, cwd: str) -> dict | None:
+        try:
+            args = shlex.split(command)
+        except ValueError:
+            return None
+        if len(args) < 3 or args[:2] != ["gladiator", "skill"]:
+            return None
+        if self.skill_manager is None:
+            return {"output": "Skills are unavailable.", "returncode": 2, "exception_info": "skills unavailable"}
+        operation = args[2]
+        try:
+            if operation == "list" and len(args) == 3:
+                names = self.skill_manager.list()
+                output = "Available skills:\n" + "\n".join(f"- {name}" for name in names) if names else "No user-created skills."
+            elif operation == "read" and len(args) == 4:
+                output = self.skill_manager.read(args[3])
+            elif operation == "write" and len(args) == 5:
+                if not self.skill_write_authorized:
+                    return {
+                        "output": "Skill writes are locked. The current user turn did not explicitly request creating or changing a skill.",
+                        "returncode": 3,
+                        "exception_info": "skill write not user-authorized",
+                    }
+                base = Path(cwd or self.config.cwd or self.workspace_root)
+                source = Path(args[4]).expanduser()
+                if not source.is_absolute():
+                    source = base / source
+                source = source.resolve()
+                try:
+                    source.relative_to(self.workspace_root)
+                except ValueError:
+                    return {
+                        "output": f"Skill source must be inside workspace: {source}",
+                        "returncode": 2,
+                        "exception_info": "skill source outside workspace",
+                    }
+                target = self.skill_manager.write_from_file(args[3], source)
+                output = f"Skill saved: {target}"
+            elif operation == "delete" and len(args) == 4:
+                if not self.skill_write_authorized:
+                    return {
+                        "output": "Skill changes are locked. The current user turn did not explicitly request changing a skill.",
+                        "returncode": 3,
+                        "exception_info": "skill write not user-authorized",
+                    }
+                self.skill_manager.delete(args[3])
+                output = f"Skill deleted: {args[3]}"
+            else:
+                return {
+                    "output": "Usage: gladiator skill list | read NAME | write NAME SOURCE_PATH | delete NAME",
+                    "returncode": 2,
+                    "exception_info": "invalid skill command",
+                }
+        except Exception as exc:
+            return {"output": f"Skill operation failed: {exc}", "returncode": 1, "exception_info": type(exc).__name__}
         return {"output": output, "returncode": 0, "exception_info": ""}
 
     @staticmethod

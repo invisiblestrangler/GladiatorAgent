@@ -10,11 +10,12 @@ from threading import Event
 from rich.console import Console
 
 from gladiator.agent import GladiatorAgent
-from gladiator.config import GladiatorConfig
+from gladiator.config import GladiatorConfig, data_root
 from gladiator.environment import GladiatorLocalEnvironment
 from gladiator.events import AgentEvent, EventKind
 from gladiator.models import OpenAICompatibleStreamingModel
 from gladiator.runtime.decision import DecisionBroker, DecisionRequest, DecisionResult
+from gladiator.skills import SkillManager, user_explicitly_requested_skill_write
 from gladiator.telegram.bot import IncomingTask, TelegramBotRuntime
 from gladiator.telegram.renderer import markdown_to_telegram_html, split_markdown
 from gladiator.telegram.traces import TraceHighlighter
@@ -51,6 +52,7 @@ class GladiatorService:
             char_limit=config.runtime.web_observation_char_limit,
             search_result_limit=config.runtime.search_result_limit,
         ) if config.search.mode != "none" else None
+        self.skill_manager = SkillManager(data_root() / "skills")
         self.environment = GladiatorLocalEnvironment(
             output_dir=self.state_dir / "tool-output",
             workspace_root=self.workspace,
@@ -58,6 +60,7 @@ class GladiatorService:
             event_sink=self._emit_from_agent_thread,
             decision_handler=self._resolve_decision_from_agent_thread,
             web_tools=web_tools,
+            skill_manager=self.skill_manager,
             cwd=str(self.workspace),
             env={"PAGER": "cat", "MANPAGER": "cat", "PIP_PROGRESS_BAR": "off", "TQDM_DISABLE": "1"},
             timeout=120,
@@ -134,6 +137,7 @@ class GladiatorService:
             self._current_chat_id = chat_id
             self.cancel_event.clear()
             self._refresh_model_settings()
+            self.environment.skill_write_authorized = user_explicitly_requested_skill_write(incoming.text)
             self._drain_event_queue()
             draft_id = int(time.time_ns() % 2_000_000_000) or 1
             finished = asyncio.Event()
@@ -167,6 +171,7 @@ class GladiatorService:
                         pass
                     except Exception as exc:
                         console.print(f"[yellow]Telegram progress task failed: {exc}[/yellow]")
+                self.environment.skill_write_authorized = False
                 self._current_chat_id = None
 
     def _refresh_model_settings(self) -> None:
