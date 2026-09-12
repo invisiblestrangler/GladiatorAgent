@@ -96,11 +96,13 @@ The wizard asks for:
 - OpenAI-compatible endpoint — include `/v1` when your provider expects it
 - API key
 - model ID; Gladiator can try to fetch `/models` for you
-- reasoning level: `off`, `minimal`, `low`, `medium`, `high`, or `xhigh`
+- reasoning level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `ultra`
 - Telegram bot token
 - web search mode: none, local SearXNG, or an existing SearXNG instance
 - optional Docker installation when local SearXNG is selected and Docker is missing
 - optional isolated `browser-use` installation for heavier browser automation
+
+Reasoning support is provider/model dependent. Gladiator exposes the full configured set and passes the selected value through to the OpenAI-compatible endpoint rather than artificially restricting higher levels.
 
 Secrets are stored in Gladiator's local user configuration and are not inserted into model context.
 
@@ -220,7 +222,7 @@ Typing `/` in Telegram displays the registered command list while Gladiator is r
 - `/start` or `/help` — show available controls
 - `/status` — provider/model/reasoning, approximate context size, local session, TODO count, and provider-reported prompt-cache metrics when available
 - `/model [id]` — show or change model
-- `/reasoning [off|minimal|low|medium|high|xhigh]`
+- `/reasoning [off|minimal|low|medium|high|xhigh|max|ultra]`
 - `/trace [off|milestones|verbose]`
 - `/provider [endpoint] [api-key]` — show/change OpenAI-compatible provider; when a key is included Gladiator attempts to remove that Telegram message immediately
 - `/compact` — compact at the next safe agent boundary
