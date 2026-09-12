@@ -9,7 +9,7 @@ from typing import Awaitable, Callable
 
 from rich.console import Console
 
-from gladiator.config import GladiatorConfig, save_config
+from gladiator.config import REASONING_EFFORTS, GladiatorConfig, save_config
 from gladiator.runtime.decision import DecisionRequest
 from gladiator.telegram.client import TelegramClient
 
@@ -154,12 +154,13 @@ class TelegramBotRuntime:
         argument = argument.strip()
 
         if command in {"/start", "/help"}:
+            reasoning_choices = "|".join(REASONING_EFFORTS)
             await self.client.send_message(
                 chat_id,
                 "<b>Gladiator</b>\n"
                 "/status — runtime state\n"
                 "/model [id] — show/change model\n"
-                "/reasoning [off|minimal|low|medium|high|xhigh]\n"
+                f"/reasoning [{reasoning_choices}]\n"
                 "/trace [off|milestones|verbose]\n"
                 "/provider [endpoint] [api-key] — show/change OpenAI-compatible provider\n"
                 "/compact — compact at the next safe boundary\n"
@@ -178,10 +179,12 @@ class TelegramBotRuntime:
             await self.client.send_message(chat_id, f"Model: <code>{html.escape(self.config.provider.model)}</code>")
             return True
         if command == "/reasoning":
-            allowed = {"off", "minimal", "low", "medium", "high", "xhigh"}
             if argument:
-                if argument not in allowed:
-                    await self.client.send_message(chat_id, "Invalid reasoning level.")
+                if argument not in REASONING_EFFORTS:
+                    await self.client.send_message(
+                        chat_id,
+                        "Invalid reasoning level. Choose: <code>" + " | ".join(REASONING_EFFORTS) + "</code>",
+                    )
                     return True
                 self.config.provider.reasoning_effort = argument  # type: ignore[assignment]
                 save_config(self.config, self.config_path)
