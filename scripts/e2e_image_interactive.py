@@ -25,7 +25,6 @@ from gladiator.telegram.bot import IncomingTask
 
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_MODEL = "dots-studio/dots-3-note-preview:free"
-FINAL_PREFIX = "IMAGE_DESCRIPTION:"
 OUTPUT_NAME = "gladiator_square.png"
 
 
@@ -217,20 +216,24 @@ async def main() -> None:
         output_path = workspace / OUTPUT_NAME
         task = IncomingTask(
             text=(
-                "Interactive multimodal E2E test. Inspect the attached image yourself and describe what you see accurately. "
+                "Interactive multimodal E2E test. Inspect the attached image yourself. Keep working-turn prose minimal; "
+                "do not narrate the full visual description before the tool work is complete. "
                 f"The downloaded source image is also available at {source.resolve()}. Its decoded size is {source_size[0]}x{source_size[1]}. "
-                "Then use bash and Python Pillow to crop the image to the largest possible CENTERED 1:1 square without stretching or adding borders. "
+                "Use bash and Python Pillow to crop the image to the largest possible CENTERED 1:1 square without stretching or adding borders. "
                 f"Save the result exactly to {output_path.resolve()}. Re-open the saved image and verify width == height. "
                 f"Then send the cropped image back to the user with `gladiator send {output_path.resolve()}` as a sole bash command. "
-                f"After the artifact is sent, finish with a concise final response whose first line begins exactly `{FINAL_PREFIX}` followed by your visual description. "
-                "On later lines state the original dimensions and the final square dimensions."
+                "After the artifact is sent, return ONE concise final answer: a short visual description, then one line for the original dimensions "
+                "and one line for the final square dimensions. Do not repeat the description."
             ),
             image_paths=incoming.image_paths,
         )
         await service.handle_task(user_id, task)
 
-        if not final_outputs or not final_outputs[-1].lstrip().startswith(FINAL_PREFIX):
-            raise RuntimeError("Model did not return the required image-description final response")
+        if not final_outputs:
+            raise RuntimeError("Model did not return a final image description")
+        final_text = final_outputs[-1].strip()
+        if len(final_text) < 60 or "Original dimensions" not in final_text or "Final square dimensions" not in final_text:
+            raise RuntimeError("Model final response was missing the expected concise description/dimensions")
         if not output_path.exists():
             raise RuntimeError("Agent did not create the expected square crop")
         with Image.open(output_path) as cropped:
