@@ -7,6 +7,7 @@ import typer
 from rich.console import Console
 
 from gladiator.config import (
+    REASONING_EFFORTS,
     BrowserConfig,
     GladiatorConfig,
     ProviderConfig,
@@ -72,12 +73,13 @@ def run_setup(*, destination: Path | None = None) -> Path:
     base_url = _normalize_base_url(typer.prompt("OpenAI-compatible endpoint (include /v1 if required)"))
     api_key = typer.prompt("API key", hide_input=True)
     model = _choose_model(base_url, api_key)
+    reasoning_choices = "/".join(REASONING_EFFORTS)
     reasoning = typer.prompt(
-        "Default reasoning (off/minimal/low/medium/high/xhigh)",
+        f"Default reasoning ({reasoning_choices})",
         default="high",
     ).lower()
-    if reasoning not in {"off", "minimal", "low", "medium", "high", "xhigh"}:
-        raise typer.BadParameter("Unsupported reasoning setting")
+    if reasoning not in REASONING_EFFORTS:
+        raise typer.BadParameter(f"Unsupported reasoning setting. Choose one of: {reasoning_choices}")
 
     bot_token = typer.prompt("Telegram bot token", hide_input=True)
     try:
