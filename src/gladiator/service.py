@@ -141,10 +141,14 @@ class GladiatorService:
             self._drain_event_queue()
             draft_id = int(time.time_ns() % 2_000_000_000) or 1
             finished = asyncio.Event()
+            progress_message = await self.bot.client.send_message(chat_id, "<i>Working…</i>")
+            progress_message_id = int(progress_message["message_id"])
             typing_task = asyncio.create_task(self._typing_heartbeat(chat_id, finished))
-            event_task = asyncio.create_task(self._consume_events(chat_id, draft_id, finished))
+            event_task = asyncio.create_task(self._consume_events(chat_id, progress_message_id, finished))
             try:
-                await self.bot.client.send_message_draft(chat_id, draft_id, "", can_stop=True)
+                # Keep one static draft only for Telegram's native Stop-generation control.
+                # Visible progress is edited in-place on the persistent message above.
+                await self.bot.client.send_message_draft(chat_id, draft_id, "Working…", can_stop=True)
                 result = await asyncio.to_thread(
                     self.agent.run_task,
                     incoming.text,
@@ -200,12 +204,13 @@ class GladiatorService:
             except asyncio.TimeoutError:
                 continue
 
-    async def _consume_events(self, chat_id: int, draft_id: int, finished: asyncio.Event) -> None:
+    async def _consume_events(self, chat_id: int, message_id: int, finished: asyncio.Event) -> None:
         highlighter = TraceHighlighter()
         milestones: deque[str] = deque(maxlen=8)
         visible_text = ""
         verbose_reasoning = ""
         last_update = 0.0
+        last_rendered = "<i>Working…</i>"
 
         while not finished.is_set() or not self._events.empty():
             try:
@@ -239,13 +244,12 @@ class GladiatorService:
             if now - last_update < 0.55:
                 continue
             body = self._draft_body(milestones, visible_text, verbose_reasoning)
+            rendered = markdown_to_telegram_html(body) if body else "<i>Working…</i>"
+            if rendered == last_rendered:
+                continue
             try:
-                await self.bot.client.send_message_draft(
-                    chat_id,
-                    draft_id,
-                    markdown_to_telegram_html(body) if body else "",
-                    can_stop=True,
-                )
+                await self.bot.client.edit_message_text(chat_id, message_id, rendered)
+                last_rendered = rendered
                 last_update = now
             except Exception:
                 pass
