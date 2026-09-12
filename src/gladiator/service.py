@@ -139,16 +139,16 @@ class GladiatorService:
             self._refresh_model_settings()
             self.environment.skill_write_authorized = user_explicitly_requested_skill_write(incoming.text)
             self._drain_event_queue()
-            draft_id = int(time.time_ns() % 2_000_000_000) or 1
             finished = asyncio.Event()
-            progress_message = await self.bot.client.send_message(chat_id, "<i>Working…</i>")
+            progress_message = await self.bot.client.send_message(
+                chat_id,
+                "<i>Working…</i>",
+                reply_markup=self._stop_reply_markup(),
+            )
             progress_message_id = int(progress_message["message_id"])
             typing_task = asyncio.create_task(self._typing_heartbeat(chat_id, finished))
             event_task = asyncio.create_task(self._consume_events(chat_id, progress_message_id, finished))
             try:
-                # Keep one static draft only for Telegram's native Stop-generation control.
-                # Visible progress is edited in-place on the persistent message above.
-                await self.bot.client.send_message_draft(chat_id, draft_id, "Working…", can_stop=True)
                 result = await asyncio.to_thread(
                     self.agent.run_task,
                     incoming.text,
@@ -175,8 +175,16 @@ class GladiatorService:
                         pass
                     except Exception as exc:
                         console.print(f"[yellow]Telegram progress task failed: {exc}[/yellow]")
+                try:
+                    await self.bot.client.edit_message_reply_markup(chat_id, progress_message_id, None)
+                except Exception:
+                    pass
                 self.environment.skill_write_authorized = False
                 self._current_chat_id = None
+
+    @staticmethod
+    def _stop_reply_markup() -> dict:
+        return {"inline_keyboard": [[{"text": "Stop", "callback_data": "gladiator:stop"}]]}
 
     def _refresh_model_settings(self) -> None:
         provider = self.config.provider
@@ -207,7 +215,6 @@ class GladiatorService:
     async def _consume_events(self, chat_id: int, message_id: int, finished: asyncio.Event) -> None:
         highlighter = TraceHighlighter()
         milestones: deque[str] = deque(maxlen=8)
-        visible_text = ""
         verbose_reasoning = ""
         last_update = 0.0
         last_rendered = "<i>Working…</i>"
@@ -223,8 +230,6 @@ class GladiatorService:
                     milestones.extend(highlighter.feed(event.text))
                 elif self.config.runtime.trace_mode == "verbose":
                     verbose_reasoning = (verbose_reasoning + event.text)[-1800:]
-            elif event.kind == EventKind.TEXT_DELTA:
-                visible_text = (visible_text + event.text)[-1800:]
             elif event.kind == EventKind.TOOL_STARTED:
                 command = str(event.data.get("command", "")).replace("\n", " ")
                 milestones.append(f"▶ {command[:220]}")
@@ -243,27 +248,29 @@ class GladiatorService:
             now = time.monotonic()
             if now - last_update < 0.55:
                 continue
-            body = self._draft_body(milestones, visible_text, verbose_reasoning)
+            body = self._draft_body(milestones, verbose_reasoning)
             rendered = markdown_to_telegram_html(body) if body else "<i>Working…</i>"
             if rendered == last_rendered:
                 continue
             try:
-                await self.bot.client.edit_message_text(chat_id, message_id, rendered)
+                await self.bot.client.edit_message_text(
+                    chat_id,
+                    message_id,
+                    rendered,
+                    reply_markup=self._stop_reply_markup(),
+                )
                 last_rendered = rendered
                 last_update = now
             except Exception:
                 pass
 
-    def _draft_body(self, milestones: deque[str], visible_text: str, verbose_reasoning: str) -> str:
-        parts: list[str] = []
+    def _draft_body(self, milestones: deque[str], verbose_reasoning: str) -> str:
         trace_mode = self.config.runtime.trace_mode
         if trace_mode == "verbose" and verbose_reasoning.strip():
-            parts.append("Thinking…\n" + verbose_reasoning.strip())
-        elif milestones:
-            parts.append("Working…\n" + "\n".join(milestones))
-        if visible_text.strip():
-            parts.append(visible_text.strip())
-        return "\n\n".join(parts)[-3400:]
+            return "Thinking…\n" + verbose_reasoning.strip()
+        if milestones:
+            return "Working…\n" + "\n".join(milestones)
+        return ""
 
     async def _send_markdown(self, chat_id: int, text: str) -> None:
         for chunk in split_markdown(text, limit=3400):
