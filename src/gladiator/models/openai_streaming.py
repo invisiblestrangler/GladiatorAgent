@@ -12,7 +12,7 @@ import httpx
 from jinja2 import StrictUndefined, Template
 
 from gladiator.events import AgentEvent, EventKind, EventSink, null_event_sink
-from minisweagent.exceptions import FormatError, UserInterruption
+from minisweagent.exceptions import FormatError, Submitted, UserInterruption
 from minisweagent.models.utils.actions_toolcall import BASH_TOOL, format_toolcall_observation_messages
 
 
@@ -128,7 +128,35 @@ class OpenAICompatibleStreamingModel:
                         self.event_sink(AgentEvent(EventKind.REASONING_DELTA, reasoning))
                     self._merge_tool_call_deltas(tool_calls, delta.get("tool_calls") or [])
 
+        content = "".join(content_parts).strip()
+        reasoning = "".join(reasoning_parts)
         assembled_calls = [tool_calls[index] for index in sorted(tool_calls)]
+        self.last_usage = usage
+        self.event_sink(AgentEvent(EventKind.RESPONSE_FINISHED, data={"usage": usage, "finish_reason": finish_reason}))
+
+        if not assembled_calls:
+            if content and self._has_prior_tool_activity(messages):
+                raise Submitted(
+                    {
+                        "role": "exit",
+                        "content": content,
+                        "extra": {
+                            "exit_status": "Submitted",
+                            "submission": content,
+                            "cost": 0.0,
+                            "usage": usage,
+                            "reasoning": reasoning,
+                            "timestamp": time.time(),
+                            "finish_reason": finish_reason,
+                        },
+                    }
+                )
+            self._raise_format_error(
+                "No tool calls found in the response. Working turns must call the bash tool; "
+                "a text-only response is accepted only after tool work has occurred.",
+                finish_reason=finish_reason,
+            )
+
         actions = self._parse_actions(assembled_calls, finish_reason=finish_reason)
         message: dict[str, Any] = {
             "role": "assistant",
@@ -138,13 +166,11 @@ class OpenAICompatibleStreamingModel:
                 "actions": actions,
                 "cost": 0.0,
                 "usage": usage,
-                "reasoning": "".join(reasoning_parts),
+                "reasoning": reasoning,
                 "timestamp": time.time(),
                 "finish_reason": finish_reason,
             },
         }
-        self.last_usage = usage
-        self.event_sink(AgentEvent(EventKind.RESPONSE_FINISHED, data={"usage": usage, "finish_reason": finish_reason}))
         return message
 
     def _raise_if_cancelled(self) -> None:
@@ -156,6 +182,16 @@ class OpenAICompatibleStreamingModel:
                     "extra": {"exit_status": "Cancelled", "submission": "Cancelled by user."},
                 }
             )
+
+    @staticmethod
+    def _has_prior_tool_activity(messages: list[dict]) -> bool:
+        for message in messages:
+            if message.get("tool_calls"):
+                return True
+            extra = message.get("extra")
+            if isinstance(extra, dict) and extra.get("actions"):
+                return True
+        return False
 
     @staticmethod
     def _extract_reasoning_delta(delta: dict[str, Any]) -> str:
