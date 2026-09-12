@@ -1,6 +1,10 @@
 from collections import deque
 
+import pytest
+
 from gladiator.service import GladiatorService
+from gladiator.telegram.bot import TELEGRAM_COMMANDS
+from gladiator.telegram.client import TelegramClient
 from gladiator.telegram.renderer import markdown_to_telegram_html, split_markdown
 from gladiator.telegram.traces import TraceHighlighter, reasoning_preview, summarize_shell_command
 
@@ -79,3 +83,35 @@ def test_final_progress_summary_preserves_observation_and_recent_results():
     assert "src/gladiator/service.py" in body
     assert "tests/test_telegram_helpers.py" in body
     assert "result.png" in body
+
+
+def test_native_telegram_command_menu_contains_runtime_controls():
+    names = {name for name, _description in TELEGRAM_COMMANDS}
+    assert {"status", "model", "reasoning", "trace", "provider", "compact", "new", "todo", "stop"} <= names
+
+
+@pytest.mark.asyncio
+async def test_set_my_commands_uses_telegram_command_payload(monkeypatch):
+    client = TelegramClient("test-token")
+    captured = {}
+
+    async def fake_call(method, payload=None):
+        captured["method"] = method
+        captured["payload"] = payload
+        return True
+
+    monkeypatch.setattr(client, "_call", fake_call)
+    try:
+        assert await client.set_my_commands([("/status", "Show status"), ("new", "New session")]) is True
+    finally:
+        await client.close()
+
+    assert captured == {
+        "method": "setMyCommands",
+        "payload": {
+            "commands": [
+                {"command": "status", "description": "Show status"},
+                {"command": "new", "description": "New session"},
+            ]
+        },
+    }

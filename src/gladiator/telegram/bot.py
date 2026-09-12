@@ -15,6 +15,20 @@ from gladiator.telegram.client import TelegramClient
 
 console = Console()
 
+TELEGRAM_COMMANDS: list[tuple[str, str]] = [
+    ("start", "Show Gladiator help"),
+    ("status", "Show runtime, model, context and cache status"),
+    ("model", "Show or change the model"),
+    ("reasoning", "Show or change reasoning level"),
+    ("trace", "Show or change progress trace mode"),
+    ("provider", "Show or change OpenAI-compatible endpoint"),
+    ("compact", "Compact context at the next safe boundary"),
+    ("new", "Start a clean agent session"),
+    ("todo", "Show the current task ledger"),
+    ("stop", "Stop the current agent run"),
+    ("help", "Show Gladiator help"),
+]
+
 
 @dataclass(slots=True)
 class IncomingTask:
@@ -52,6 +66,11 @@ class TelegramBotRuntime:
         self._decision_waiters: dict[int, tuple[DecisionRequest, asyncio.Future[str | None]]] = {}
 
     async def run_forever(self) -> None:
+        try:
+            await self.client.set_my_commands(TELEGRAM_COMMANDS)
+        except Exception as exc:
+            console.print(f"[yellow]Could not register Telegram command menu: {exc}[/yellow]")
+
         if not self.config.telegram.allowed_user_ids:
             console.print(
                 "[yellow]Telegram is not paired yet.[/yellow] "
@@ -144,6 +163,8 @@ class TelegramBotRuntime:
                 "/trace [off|milestones|verbose]\n"
                 "/provider [endpoint] [api-key] — show/change OpenAI-compatible provider\n"
                 "/compact — compact at the next safe boundary\n"
+                "/new — start a clean agent session\n"
+                "/todo — show the current task ledger\n"
                 "/stop — stop the current run",
             )
             return True
