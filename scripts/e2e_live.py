@@ -37,6 +37,21 @@ def retryable_provider_error(exc: BaseException) -> bool:
     return exc.response.status_code in {429, 500, 502, 503, 504}
 
 
+def has_stop_button(reply_markup: object) -> bool:
+    if not isinstance(reply_markup, dict):
+        return False
+    rows = reply_markup.get("inline_keyboard")
+    if not isinstance(rows, list):
+        return False
+    for row in rows:
+        if not isinstance(row, list):
+            continue
+        for button in row:
+            if isinstance(button, dict) and button.get("callback_data") == "gladiator:stop":
+                return True
+    return False
+
+
 async def run_once(*, api_key: str, bot_token: str, user_id: int, attempt: int) -> None:
     workspace = Path(tempfile.mkdtemp(prefix=f"gladiator-e2e-{attempt}-"))
     config_path = workspace / ".gladiator" / "e2e-config.json"
@@ -62,13 +77,23 @@ async def run_once(*, api_key: str, bot_token: str, user_id: int, attempt: int) 
     final_outputs: list[str] = []
     draft_calls = 0
     edit_calls = 0
+    clear_markup_calls = 0
+    stop_markup_seen = False
     original_send_markdown = service._send_markdown
+    original_send_message = service.bot.client.send_message
     original_send_message_draft = service.bot.client.send_message_draft
     original_edit_message_text = service.bot.client.edit_message_text
+    original_edit_message_reply_markup = service.bot.client.edit_message_reply_markup
 
     async def capture_and_send_markdown(chat_id: int, text: str) -> None:
         final_outputs.append(text)
         await original_send_markdown(chat_id, text)
+
+    async def inspect_send_message(*args, **kwargs):
+        nonlocal stop_markup_seen
+        if has_stop_button(kwargs.get("reply_markup")):
+            stop_markup_seen = True
+        return await original_send_message(*args, **kwargs)
 
     async def count_draft(*args, **kwargs):
         nonlocal draft_calls
@@ -76,13 +101,26 @@ async def run_once(*, api_key: str, bot_token: str, user_id: int, attempt: int) 
         return await original_send_message_draft(*args, **kwargs)
 
     async def count_edit(*args, **kwargs):
-        nonlocal edit_calls
+        nonlocal edit_calls, stop_markup_seen
         edit_calls += 1
+        if has_stop_button(kwargs.get("reply_markup")):
+            stop_markup_seen = True
         return await original_edit_message_text(*args, **kwargs)
 
+    async def count_markup_clear(*args, **kwargs):
+        nonlocal clear_markup_calls
+        reply_markup = kwargs.get("reply_markup")
+        if len(args) >= 3:
+            reply_markup = args[2]
+        if reply_markup is None:
+            clear_markup_calls += 1
+        return await original_edit_message_reply_markup(*args, **kwargs)
+
     service._send_markdown = capture_and_send_markdown  # type: ignore[method-assign]
+    service.bot.client.send_message = inspect_send_message  # type: ignore[method-assign]
     service.bot.client.send_message_draft = count_draft  # type: ignore[method-assign]
     service.bot.client.edit_message_text = count_edit  # type: ignore[method-assign]
+    service.bot.client.edit_message_reply_markup = count_markup_clear  # type: ignore[method-assign]
 
     try:
         identity = await service.bot.client._call("getMe")
@@ -110,10 +148,14 @@ async def run_once(*, api_key: str, bot_token: str, user_id: int, attempt: int) 
         )
         await service.handle_task(user_id, task)
 
-        if draft_calls != 1:
-            raise RuntimeError(f"Progress draft was sent {draft_calls} times; expected exactly one static Stop-control draft")
+        if draft_calls != 0:
+            raise RuntimeError(f"Telegram progress drafts were sent {draft_calls} times; expected zero")
+        if not stop_markup_seen:
+            raise RuntimeError("Persistent Telegram progress message never exposed the inline Stop button")
         if edit_calls < 1:
             raise RuntimeError("Persistent Telegram progress message was never edited in place")
+        if clear_markup_calls < 1:
+            raise RuntimeError("Stop button was not removed after the task completed")
         if not final_outputs or final_outputs[-1].strip() != FINAL_SENTINEL:
             raise RuntimeError("Agent final submission did not match the expected E2E sentinel")
         probe = workspace / "e2e_probe.txt"
@@ -137,7 +179,7 @@ async def run_once(*, api_key: str, bot_token: str, user_id: int, attempt: int) 
 
         await service.bot.client.send_message(
             user_id,
-            "<b>Gladiator E2E PASS</b>\nTelegram ✓\nStable progress edits ✓\nSingle Stop draft ✓\nModel stream ✓\nFinal submission ✓\nBash tool loop ✓\nTODO ledger ✓\n/new archive + reset ✓",
+            "<b>Gladiator E2E PASS</b>\nTelegram ✓\nSingle persistent progress message ✓\nInline Stop button ✓\nNo duplicate draft ✓\nModel stream ✓\nFinal submission ✓\nBash tool loop ✓\nTODO ledger ✓\n/new archive + reset ✓",
         )
     finally:
         await service.bot.client.close()
