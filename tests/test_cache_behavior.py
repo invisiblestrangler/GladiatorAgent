@@ -8,8 +8,7 @@ from gladiator.runtime.session import load_or_create_session, rotate_session
 
 
 class FakeResponse:
-    def __init__(self):
-        self.headers = {"X-OpenRouter-Cache-Status": "MISS"}
+    headers = {}
 
     def __enter__(self):
         return self
@@ -65,52 +64,50 @@ class FakeClient:
         return FakeResponse()
 
 
-def test_openrouter_cache_transport(monkeypatch):
+def test_provider_request_has_no_vendor_specific_cache_controls(monkeypatch):
     monkeypatch.setattr("gladiator.models.openai_streaming.httpx.Client", FakeClient)
     model = OpenAICompatibleStreamingModel(
-        base_url="https://openrouter.ai/api/v1",
+        base_url="https://example.invalid/v1",
         api_key="test-key",
         model_name="test/model",
-        session_id="gladiator-stable-session",
     )
 
     response = model.query(
         [
-            {"role": "system", "content": "stable-prefix"},
+            {"role": "system", "content": "stable-prefix", "extra": {"timestamp": 123}},
             {"role": "user", "content": "do the work"},
         ]
     )
 
     assert response["extra"]["actions"][0]["command"] == "true"
     _, _, request = FakeClient.last_request
-    assert request["json"]["session_id"] == "gladiator-stable-session"
-    assert request["json"]["stream_options"] == {"include_usage": True}
-    assert request["headers"]["x-session-id"] == "gladiator-stable-session"
-    assert request["headers"]["X-OpenRouter-Cache"] == "true"
-    assert request["headers"]["X-OpenRouter-Cache-TTL"] == "300"
-    assert model.last_response_cache_status == "MISS"
+    payload = request["json"]
+    headers = request["headers"]
+
+    assert payload["messages"][0] == {"role": "system", "content": "stable-prefix"}
+    assert set(payload) == {"model", "messages", "tools", "tool_choice", "stream", "reasoning_effort"}
+    assert set(headers) == {"Authorization", "Content-Type"}
     assert model.last_prompt_cache_ratio == 0.8
     assert model.cumulative_prompt_cache_ratio == 0.8
     assert model.total_cache_write_tokens == 10
 
 
-def test_non_openrouter_does_not_add_openrouter_cache_controls(monkeypatch):
-    monkeypatch.setattr("gladiator.models.openai_streaming.httpx.Client", FakeClient)
+def test_api_visible_prefix_is_stable_when_history_is_appended():
     model = OpenAICompatibleStreamingModel(
         base_url="https://example.invalid/v1",
         api_key="test-key",
         model_name="test/model",
-        session_id="same-session",
     )
-    model.query([{"role": "user", "content": "work"}])
-    _, _, request = FakeClient.last_request
-    assert "session_id" not in request["json"]
-    assert "stream_options" not in request["json"]
-    assert "X-OpenRouter-Cache" not in request["headers"]
-    assert "x-session-id" not in request["headers"]
+    original = [
+        {"role": "system", "content": "stable-prefix", "extra": {"ui": "ignored"}},
+        {"role": "user", "content": "first"},
+    ]
+    first = model._prepare_messages_for_api(original)
+    second = model._prepare_messages_for_api(original + [{"role": "assistant", "content": "later"}])
+    assert second[: len(first)] == first
 
 
-def test_session_persists_and_rotates(tmp_path):
+def test_session_persists_and_rotates_locally(tmp_path):
     path = tmp_path / "session.json"
     first = load_or_create_session(path)
     restored = load_or_create_session(path)
@@ -121,7 +118,7 @@ def test_session_persists_and_rotates(tmp_path):
     assert load_or_create_session(path).session_id == replacement.session_id
 
 
-def test_cache_stats_accumulate():
+def test_cache_stats_accumulate_when_provider_reports_them():
     stats = CacheStats()
     stats.add_usage(
         {
