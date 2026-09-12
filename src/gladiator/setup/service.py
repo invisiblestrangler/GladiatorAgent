@@ -72,7 +72,8 @@ class ServiceStatus:
 class BackgroundServiceManager:
     def __init__(self, workspace: Path, *, executable: Path | None = None):
         self.workspace = workspace.expanduser().resolve()
-        resolved = executable or (Path(shutil.which("gladiator")) if shutil.which("gladiator") else None)
+        found = shutil.which("gladiator")
+        resolved = executable or (Path(found) if found else None)
         if resolved is None:
             resolved = Path(sys.argv[0])
         self.executable = resolved.expanduser().resolve()
@@ -102,6 +103,14 @@ class BackgroundServiceManager:
     def launchd_path(self) -> Path:
         return Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
 
+    @property
+    def launchd_domain(self) -> str:
+        return f"gui/{os.getuid()}"
+
+    @property
+    def launchd_target(self) -> str:
+        return f"{self.launchd_domain}/{LAUNCHD_LABEL}"
+
     def install(self) -> str:
         if not self.workspace.is_dir():
             raise RuntimeError(f"Workspace does not exist: {self.workspace}")
@@ -118,8 +127,10 @@ class BackgroundServiceManager:
             result = _run(self._systemctl_args("start"))
             return result.stdout.strip() or "Gladiator service started."
         if self.platform == "macos":
-            target = f"gui/{os.getuid()}/{LAUNCHD_LABEL}"
-            _run(["launchctl", "kickstart", "-k", target])
+            if not self.launchd_path.exists():
+                raise RuntimeError("Gladiator launchd service is not installed.")
+            _run(["launchctl", "bootstrap", self.launchd_domain, str(self.launchd_path)], check=False)
+            _run(["launchctl", "kickstart", "-k", self.launchd_target])
             return "Gladiator service started."
         raise RuntimeError("Unsupported platform.")
 
@@ -128,8 +139,9 @@ class BackgroundServiceManager:
             result = _run(self._systemctl_args("stop"))
             return result.stdout.strip() or "Gladiator service stopped."
         if self.platform == "macos":
-            target = f"gui/{os.getuid()}/{LAUNCHD_LABEL}"
-            _run(["launchctl", "kill", "SIGTERM", target], check=False)
+            if not self.launchd_path.exists():
+                return "Gladiator service is not installed."
+            _run(["launchctl", "bootout", self.launchd_domain, str(self.launchd_path)], check=False)
             return "Gladiator service stopped."
         raise RuntimeError("Unsupported platform.")
 
@@ -138,8 +150,11 @@ class BackgroundServiceManager:
             result = _run(self._systemctl_args("restart"))
             return result.stdout.strip() or "Gladiator service restarted."
         if self.platform == "macos":
-            target = f"gui/{os.getuid()}/{LAUNCHD_LABEL}"
-            _run(["launchctl", "kickstart", "-k", target])
+            if not self.launchd_path.exists():
+                raise RuntimeError("Gladiator launchd service is not installed.")
+            _run(["launchctl", "bootout", self.launchd_domain, str(self.launchd_path)], check=False)
+            _run(["launchctl", "bootstrap", self.launchd_domain, str(self.launchd_path)])
+            _run(["launchctl", "kickstart", "-k", self.launchd_target])
             return "Gladiator service restarted."
         raise RuntimeError("Unsupported platform.")
 
@@ -154,7 +169,7 @@ class BackgroundServiceManager:
             _run(self._systemctl_args("daemon-reload"), check=False)
             return f"Removed Gladiator service: {unit}"
         if self.platform == "macos":
-            _run(["launchctl", "bootout", f"gui/{os.getuid()}", str(self.launchd_path)], check=False)
+            _run(["launchctl", "bootout", self.launchd_domain, str(self.launchd_path)], check=False)
             try:
                 self.launchd_path.unlink()
             except FileNotFoundError:
@@ -175,8 +190,7 @@ class BackgroundServiceManager:
                 detail=(detail.stdout or detail.stderr).strip(),
             )
         if self.platform == "macos":
-            target = f"gui/{os.getuid()}/{LAUNCHD_LABEL}"
-            result = _run(["launchctl", "print", target], check=False)
+            result = _run(["launchctl", "print", self.launchd_target], check=False)
             return ServiceStatus(
                 installed=self.launchd_path.exists(),
                 active=result.returncode == 0,
@@ -241,11 +255,10 @@ class BackgroundServiceManager:
                 log_dir=log_dir,
             )
         )
-        domain = f"gui/{os.getuid()}"
-        _run(["launchctl", "bootout", domain, str(self.launchd_path)], check=False)
-        _run(["launchctl", "bootstrap", domain, str(self.launchd_path)])
-        _run(["launchctl", "enable", f"{domain}/{LAUNCHD_LABEL}"])
-        _run(["launchctl", "kickstart", "-k", f"{domain}/{LAUNCHD_LABEL}"])
+        _run(["launchctl", "bootout", self.launchd_domain, str(self.launchd_path)], check=False)
+        _run(["launchctl", "bootstrap", self.launchd_domain, str(self.launchd_path)])
+        _run(["launchctl", "enable", self.launchd_target])
+        _run(["launchctl", "kickstart", "-k", self.launchd_target])
         return (
             f"Installed {self.launchd_path}. Gladiator runs in the background, restarts after failures, "
             "and starts automatically when this macOS user logs in."
