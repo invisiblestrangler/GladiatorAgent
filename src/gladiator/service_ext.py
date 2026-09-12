@@ -25,7 +25,7 @@ class ExtendedGladiatorService(GladiatorService):
 
     def _emit_from_agent_thread(self, event: AgentEvent) -> None:
         if event.kind == EventKind.RESPONSE_FINISHED:
-            usage = event.data.get("qsage")
+            usage = event.data.get("usage")
             if isinstance(usage, dict):
                 self.cache_stats.add_usage(usage)
         super()._emit_from_agent_thread(event)
@@ -83,7 +83,6 @@ class ExtendedGladiatorService(GladiatorService):
             self.agent.n_consecutive_format_errors = 0
             self.agent.extra_template_vars.clear()
             self.cache_stats = CacheStats()
-            self.model.reset_cache_metrics()
             for path in (self.state_dir / "trajectory.json", self.state_dir / "contextAfterCompact.md"):
                 try:
                     path.unlink()
@@ -132,5 +131,5 @@ class ExtendedGladiatorService(GladiatorService):
             f"Ask timeout: {self.config.runtime.escalation_timeout_seconds // 60} min\n"
             f"Compact target: {self.config.runtime.compact_threshold_tokens:,} tokens\n"
             f"Search: <code>{self.config.search.mode}</code>\n"
-            f"Browser: {'YZ' if self.config.browser.enabled else 'not installed'}"
+            f"Browser: {'enabled' if self.config.browser.enabled else 'not installed'}"
         )
