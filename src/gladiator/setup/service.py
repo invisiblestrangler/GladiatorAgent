@@ -22,6 +22,30 @@ def _systemd_escape(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def _systemd_path(value: str) -> str:
+    """Encode a path for a systemd path directive such as WorkingDirectory=.
+
+    Unlike ExecStart= arguments and Environment= assignments, path directives do not
+    strip surrounding quotes before validating that the value is absolute. Encode
+    whitespace/special characters in-place instead of quoting the whole path.
+    """
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValueError(f"systemd path must be absolute: {value!r}")
+    if "\x00" in value or "\n" in value or "\r" in value:
+        raise ValueError("systemd path contains an unsupported control character")
+
+    encoded: list[str] = []
+    for char in value:
+        if char == "%":
+            encoded.append("%%")
+        elif char == "\\" or char.isspace() or char in {'"', "'"}:
+            encoded.extend(f"\\x{byte:02x}" for byte in char.encode("utf-8"))
+        else:
+            encoded.append(char)
+    return "".join(encoded)
+
+
 def systemd_unit(*, executable: Path, workspace: Path, path_env: str, user: str | None = None) -> str:
     lines = [
         "[Unit]",
@@ -31,7 +55,7 @@ def systemd_unit(*, executable: Path, workspace: Path, path_env: str, user: str 
         "",
         "[Service]",
         "Type=simple",
-        f"WorkingDirectory={_systemd_escape(str(workspace))}",
+        f"WorkingDirectory={_systemd_path(str(workspace))}",
         f"ExecStart={_systemd_escape(str(executable))} run --workspace {_systemd_escape(str(workspace))}",
         "Restart=on-failure",
         "RestartSec=3",
