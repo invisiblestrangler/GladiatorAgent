@@ -25,7 +25,7 @@ dependencies = [
 dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.8"]
 
 [project.scripts]
-gladiator = "gladiator.cli:app"
+gladiator = "gladiator.cli_ext:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gladiator"]
