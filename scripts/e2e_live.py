@@ -57,6 +57,8 @@ async def run_once(*, api_key: str, bot_token: str, user_id: int, attempt: int) 
 
     service = ExtendedGladiatorService(config=config, config_path=config_path, workspace=workspace)
     service._loop = asyncio.get_running_loop()
+    service.agent.config.step_limit = 12
+    service.agent.config.wall_time_limit_seconds = 180
     final_outputs: list[str] = []
     original_send_markdown = service._send_markdown
 
@@ -76,13 +78,18 @@ async def run_once(*, api_key: str, bot_token: str, user_id: int, attempt: int) 
             f"<b>Gladiator E2E starting</b>\nAttempt {attempt}. Running real model + bash + TODO + session-reset checks.",
         )
 
+        finish_command = (
+            "printf '%s\\n%s\\n' 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT' "
+            f"'{FINAL_SENTINEL}'"
+        )
         task = IncomingTask(
             text=(
                 "Automated Gladiator E2E test. Work autonomously and use bash. "
                 "First add one TODO named 'E2E sentinel workflow' using `gladiator todo add`. "
                 f"Then create a file named e2e_probe.txt containing exactly {SENTINEL} followed by a newline. "
                 "Read the file back and verify its exact contents. Then mark TODO #1 done with `gladiator todo done 1`. "
-                f"Finally complete the task with final output exactly `{FINAL_SENTINEL}`."
+                "After those checks succeed, finish by running this exact bash command as the sole action: "
+                f"{finish_command}"
             )
         )
         await service.handle_task(user_id, task)
