@@ -207,25 +207,37 @@ class OpenAICompatibleStreamingModel:
         self.event_sink(AgentEvent(EventKind.RESPONSE_FINISHED, data={"usage": usage, "finish_reason": finish_reason}))
 
         if not assembled_calls:
-            if content and self._has_prior_tool_activity(messages):
-                raise Submitted(
-                    {
-                        "role": "exit",
-                        "content": content,
-                        "extra": {
-                            "exit_status": "Submitted",
-                            "submission": content,
-                            "cost": 0.0,
-                            "usage": usage,
-                            "reasoning": reasoning,
-                            "timestamp": time.time(),
-                            "finish_reason": finish_reason,
-                        },
-                    }
-                )
+            if content:
+                # A compatible model is allowed to answer directly when no computer/tool work
+                # is needed. Preserve that assistant turn in history as well as the local exit
+                # marker so a later Telegram request sees a normal user/assistant conversation.
+                assistant_message = {
+                    "role": "assistant",
+                    "content": content,
+                    "extra": {
+                        "cost": 0.0,
+                        "usage": usage,
+                        "reasoning": reasoning,
+                        "timestamp": time.time(),
+                        "finish_reason": finish_reason,
+                    },
+                }
+                exit_message = {
+                    "role": "exit",
+                    "content": content,
+                    "extra": {
+                        "exit_status": "Submitted",
+                        "submission": content,
+                        "cost": 0.0,
+                        "usage": usage,
+                        "reasoning": reasoning,
+                        "timestamp": time.time(),
+                        "finish_reason": finish_reason,
+                    },
+                }
+                raise Submitted(assistant_message, exit_message)
             self._raise_format_error(
-                "No tool calls found in the response. Working turns must call the bash tool; "
-                "a text-only response is accepted only after tool work has occurred.",
+                "Provider returned neither text nor tool calls.",
                 finish_reason=finish_reason,
             )
 
@@ -304,16 +316,6 @@ class OpenAICompatibleStreamingModel:
                     "extra": {"exit_status": "Cancelled", "submission": "Cancelled by user."},
                 }
             )
-
-    @staticmethod
-    def _has_prior_tool_activity(messages: list[dict]) -> bool:
-        for message in messages:
-            if message.get("tool_calls"):
-                return True
-            extra = message.get("extra")
-            if isinstance(extra, dict) and extra.get("actions"):
-                return True
-        return False
 
     @staticmethod
     def _extract_reasoning_delta(delta: dict[str, Any]) -> str:
