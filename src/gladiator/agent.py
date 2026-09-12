@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from minisweagent.agents.default import AgentConfig, DefaultAgent
-from minisweagent.exceptions import FormatError, InterruptAgentFlow, LimitsExceeded, TimeExceeded
+from minisweagent.exceptions import FormatError, InterruptAgentFlow, LimitsExceeded, Submitted, TimeExceeded
 
 from gladiator.events import AgentEvent, EventKind, EventSink, null_event_sink
 from gladiator.runtime.prompt import GLADIATOR_RUNTIME_POLICY
@@ -99,12 +99,66 @@ class GladiatorAgent(DefaultAgent):
         chars = len(json.dumps(api_messages, ensure_ascii=False, default=str))
         return max(1, int(chars / 3.5))
 
+    def execute_actions(self, message: dict) -> list[dict]:
+        """Execute tool calls while keeping the persisted OpenAI tool transcript structurally complete.
+
+        mini-swe's LocalEnvironment raises ``Submitted`` from inside ``execute()`` when the
+        completion marker is printed. DefaultAgent.execute_actions() therefore never gets
+        the chance to append the matching ``role=tool`` observation. That leaves a dangling
+        assistant tool call which breaks the *next* user turn on strict OpenAI-compatible
+        endpoints. Close the tool call before re-raising the terminal submission.
+        """
+        actions = list(message.get("extra", {}).get("actions", []))
+        outputs: list[dict] = []
+        for action in actions:
+            try:
+                outputs.append(self.env.execute(action))
+            except Submitted as exc:
+                submission = self._interrupt_submission(exc)
+                outputs.append(
+                    {
+                        "output": "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\n" + submission,
+                        "returncode": 0,
+                        "exception_info": "",
+                        "extra": {"terminal_submission": True},
+                    }
+                )
+                observations = self.model.format_observation_messages(
+                    message,
+                    outputs,
+                    self.get_template_vars(),
+                )
+                self.add_messages(*observations)
+                command = str(action.get("command", ""))
+                self.event_sink(
+                    AgentEvent(
+                        EventKind.TOOL_FINISHED,
+                        data={"command": command, "returncode": 0, "terminal_submission": True},
+                    )
+                )
+                raise
+        return self.add_messages(*self.model.format_observation_messages(message, outputs, self.get_template_vars()))
+
+    @staticmethod
+    def _interrupt_submission(exc: Submitted) -> str:
+        for message in exc.messages:
+            extra = message.get("extra")
+            if isinstance(extra, dict) and extra.get("submission") is not None:
+                return str(extra.get("submission") or "")
+            if message.get("content") is not None:
+                return str(message.get("content") or "")
+        return ""
+
     def _start_or_continue_task(
         self, task: str, *, image_paths: list[Path] | None = None, file_paths: list[Path] | None = None
     ) -> None:
         self.extra_template_vars["task"] = task
+        terminal_exit: dict | None = None
         while self.messages and self.messages[-1].get("role") == "exit":
-            self.messages.pop()
+            popped = self.messages.pop()
+            if terminal_exit is None:
+                terminal_exit = popped
+        self._repair_legacy_submitted_tool_gap(terminal_exit)
         if not self.messages:
             self.add_messages(
                 self.model.format_message(role="system", content=self._render_template(self.config.system_template)),
@@ -118,6 +172,46 @@ class GladiatorAgent(DefaultAgent):
                 role="user", content=self._user_content(f"New user request:\n{task}", image_paths, file_paths)
             )
         )
+
+    def _repair_legacy_submitted_tool_gap(self, terminal_exit: dict | None) -> None:
+        """Repair the exact dangling-call shape written by older Gladiator completion turns.
+
+        Only a terminal ``Submitted`` exit authorizes this repair. We deliberately do not
+        invent observations after crashes, cancellations, or arbitrary malformed history.
+        """
+        if terminal_exit is None:
+            return
+        extra = terminal_exit.get("extra")
+        if not isinstance(extra, dict) or extra.get("exit_status") != "Submitted":
+            return
+        if not self.messages:
+            return
+        assistant = self.messages[-1]
+        tool_calls = assistant.get("tool_calls")
+        if assistant.get("role") != "assistant" or not isinstance(tool_calls, list) or not tool_calls:
+            return
+
+        submission = str(extra.get("submission") or terminal_exit.get("content") or "").strip()
+        note = (
+            "Previous task completed successfully. An older Gladiator version did not persist the terminal "
+            "tool observation before saving the final submission. This structural observation was restored "
+            "when the next user turn began."
+        )
+        if submission:
+            note += " Final submission: " + submission[:600]
+        repaired: list[dict] = []
+        for call in tool_calls:
+            if not isinstance(call, dict) or not call.get("id"):
+                return
+            repaired.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": str(call["id"]),
+                    "content": f"<returncode>0</returncode>\n<output>\n{note}</output>",
+                    "extra": {"legacy_terminal_repair": True},
+                }
+            )
+        self.add_messages(*repaired)
 
     @staticmethod
     def _user_content(
