@@ -8,23 +8,24 @@ from gladiator.cache_session import CacheStats
 from gladiator.events import AgentEvent, EventKind
 from gladiator.runtime.session import load_or_create_session, rotate_session
 from gladiator.service import GladiatorService
+from gladiator.todo import TodoManager
 
 
 class ExtendedGladiatorService(GladiatorService):
-    """Gladiator service with persistent sessions, restore, /new, and cache telemetry."""
+    """Gladiator service with persistent sessions, restore, /new, /todo, and cache telemetry."""
 
     def __init__(self, *args, **kwargs):
         self.cache_stats = CacheStats()
         super().__init__(*args, **kwargs)
         self.session_path = self.state_dir / "session.json"
         self.session = load_or_create_session(self.session_path)
-        self.model.session_id = self.session.session_id
+        self.todo_manager = TodoManager(self.state_dir / "todo.json")
         self._restore_trajectory()
         self._install_bot_extensions()
 
     def _emit_from_agent_thread(self, event: AgentEvent) -> None:
         if event.kind == EventKind.RESPONSE_FINISHED:
-            usage = event.data.get("usage")
+            usage = event.data.get("qsage")
             if isinstance(usage, dict):
                 self.cache_stats.add_usage(usage)
         super()._emit_from_agent_thread(event)
@@ -37,9 +38,18 @@ class ExtendedGladiatorService(GladiatorService):
             if command == "/new":
                 await self.handle_new_session(chat_id)
                 return True
+            if command == "/todo":
+                await self.bot.client.send_message(
+                    chat_id,
+                    "<b>Task ledger</b>\n<pre>" + html.escape(self.todo_manager.render()) + "</pre>",
+                )
+                return True
             handled = await original(chat_id, message, text)
             if handled and command in {"/start", "/help"}:
-                await self.bot.client.send_message(chat_id, "/new — start a clean agent session")
+                await self.bot.client.send_message(
+                    chat_id,
+                    "/new — start a clean agent session\n/todo — show the current task ledger",
+                )
             return handled
 
         self.bot._handle_command = command_handler  # type: ignore[method-assign]
@@ -79,11 +89,12 @@ class ExtendedGladiatorService(GladiatorService):
                     path.unlink()
                 except FileNotFoundError:
                     pass
+            self.todo_manager.clear()
             self.session = rotate_session(self.session_path)
-            self.model.session_id = self.session.session_id
             await self.bot.client.send_message(
                 chat_id,
-                "<b>New Gladiator session.</b> Conversation context was cleared; workspace files, skills, and settings were kept."
+                "<b>New Gladiator session.</b> Conversation context and TODO state were cleared; "
+                "workspace files, skills, and settings were kept."
                 f"\nSession: <code>{html.escape(self.session.session_id[:20])}…</code>",
             )
 
@@ -93,13 +104,14 @@ class ExtendedGladiatorService(GladiatorService):
         for source, suffix in (
             (self.state_dir / "trajectory.json", "trajectory.json"),
             (self.state_dir / "contextAfterCompact.md", "contextAfterCompact.md"),
+            (self.state_dir / "todo.json", "todo.json"),
         ):
             if source.exists():
                 shutil.copy2(source, archive / f"{session_id}.{suffix}")
 
     def _extended_status_html(self) -> str:
         ratio = self.cache_stats.hit_ratio
-        cache_text = "not reported yet" if ratio is None else f"{ratio * 100:.1f}%"
+        cache_text = "not reported" if ratio is None else f"{ratio * 100:.1f}%"
         try:
             context_tokens = self.agent.estimate_context_tokens() if self.agent.messages else 0
         except Exception:
@@ -113,12 +125,12 @@ class ExtendedGladiatorService(GladiatorService):
             "YOLO: <b>on</b>\n"
             f"Session: <code>{html.escape(self.session.session_id[:20])}…</code>\n"
             f"Context: ~{context_tokens:,} tokens\n"
-            f"Prompt cache hit ratio: <b>{cache_text}</b>\n"
+            f"Open TODOs: {self.todo_manager.open_count}\n"
+            f"Provider-reported prompt cache hit ratio: <b>{cache_text}</b>\n"
             f"Cached / prompt tokens: {self.cache_stats.cached_tokens:,} / {self.cache_stats.prompt_tokens:,}\n"
             f"Cache-write tokens: {self.cache_stats.cache_write_tokens:,}\n"
-            f"Response cache: <code>{html.escape(self.model.last_response_cache_status or 'not reported')}</code>\n"
             f"Ask timeout: {self.config.runtime.escalation_timeout_seconds // 60} min\n"
             f"Compact target: {self.config.runtime.compact_threshold_tokens:,} tokens\n"
             f"Search: <code>{self.config.search.mode}</code>\n"
-            f"Browser: {'enabled' if self.config.browser.enabled else 'not installed'}"
+            f"Browser: {'YZ' if self.config.browser.enabled else 'not installed'}"
         )

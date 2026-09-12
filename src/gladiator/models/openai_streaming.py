@@ -17,7 +17,7 @@ from gladiator.events import AgentEvent, EventKind, EventSink, null_event_sink
 
 
 class OpenAICompatibleStreamingModel:
-    """Small OpenAI-compatible chat-completions model with first-class streaming hooks."""
+    """Provider-agnostic OpenAI-compatible chat-completions model with streaming hooks."""
 
     def __init__(
         self,
@@ -26,7 +26,6 @@ class OpenAICompatibleStreamingModel:
         api_key: str,
         model_name: str,
         reasoning_effort: str = "high",
-        session_id: str | None = None,
         event_sink: EventSink = null_event_sink,
         timeout_seconds: float = 300.0,
         cancel_event: Event | None = None,
@@ -37,24 +36,18 @@ class OpenAICompatibleStreamingModel:
         self.api_key = api_key
         self.model_name = model_name
         self.reasoning_effort = reasoning_effort
-        self.session_id = session_id
         self.event_sink = event_sink
         self.timeout_seconds = timeout_seconds
         self.cancel_event = cancel_event
         self.observation_template = observation_template or (
-            "{% if output.exception_info %}<exception>{{output.exception_info}}</exception>\n{% endif %}"
+            "{	 if output.exception_info %}<exception>{{output.exception_info}}</exception>\n%{ endif %}"
             "<returncode>{{output.returncode}}</returncode>\n<output>\n{{output.output}}</output>"
         )
         self.format_error_template = format_error_template or "Format error: {{ error }}"
         self.last_usage: dict[str, Any] = {}
-        self.last_response_cache_status: str | None = None
         self.total_prompt_tokens = 0
         self.total_cached_tokens = 0
         self.total_cache_write_tokens = 0
-
-    @property
-    def is_openrouter(self) -> bool:
-        return "openrouter.ai" in self.base_url.lower()
 
     @property
     def last_prompt_cache_ratio(self) -> float | None:
@@ -68,11 +61,12 @@ class OpenAICompatibleStreamingModel:
         return (self.total_cached_tokens / self.total_prompt_tokens) if self.total_prompt_tokens > 0 else None
 
     def _prepare_messages_for_api(self, messages: list[dict]) -> list[dict]:
+        """Return only provider-visible state while preserving a byte-stable conversation prefix."""
         prepared: list[dict] = []
         for message in messages:
             if message.get("role") == "exit":
                 continue
-            clean = {k: v for k, v in message.items() if k != "extra"}
+            clean = {key: value for key, value in message.items() if key != "extra"}
             clean["content"] = self._expand_local_images(clean.get("content"))
             prepared.append(clean)
         return prepared
@@ -103,10 +97,6 @@ class OpenAICompatibleStreamingModel:
         }
         if self.reasoning_effort != "off":
             payload["reasoning_effort"] = self.reasoning_effort
-        if self.is_openrouter:
-            if self.session_id:
-                payload["session_id"] = self.session_id[:256]
-            payload["stream_options"] = {"include_usage": True}
 
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -115,17 +105,11 @@ class OpenAICompatibleStreamingModel:
         usage: dict[str, Any] = {}
 
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        if self.is_openrouter:
-            headers["X-OpenRouter-Cache"] = "true"
-            headers["X-OpenRouter-Cache-TTL"] = "300"
-            if self.session_id:
-                headers["x-session-id"] = self.session_id[:256]
         timeout = httpx.Timeout(self.timeout_seconds, connect=min(30.0, self.timeout_seconds))
         with httpx.Client(timeout=timeout) as client, client.stream(
             "POST", f"{self.base_url}/chat/completions", headers=headers, json=payload
         ) as response:
             response.raise_for_status()
-            self.last_response_cache_status = response.headers.get("X-OpenRouter-Cache-Status")
             for line in response.iter_lines():
                 self._raise_if_cancelled()
                 if not line or not line.startswith("data:"):
@@ -187,7 +171,6 @@ class OpenAICompatibleStreamingModel:
 
     def reset_cache_metrics(self) -> None:
         self.last_usage = {}
-        self.last_response_cache_status = None
         self.total_prompt_tokens = 0
         self.total_cached_tokens = 0
         self.total_cache_write_tokens = 0
@@ -292,7 +275,6 @@ class OpenAICompatibleStreamingModel:
                         "model_name": self.model_name,
                         "base_url": self.base_url,
                         "reasoning_effort": self.reasoning_effort,
-                        "session_id": self.session_id,
                     },
                 }
             }
