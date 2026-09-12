@@ -1,5 +1,8 @@
+from collections import deque
+
+from gladiator.service import GladiatorService
 from gladiator.telegram.renderer import markdown_to_telegram_html, split_markdown
-from gladiator.telegram.traces import TraceHighlighter, summarize_shell_command
+from gladiator.telegram.traces import TraceHighlighter, reasoning_preview, summarize_shell_command
 
 
 def test_renderer_preserves_fenced_code():
@@ -24,6 +27,13 @@ def test_trace_highlighter_only_emits_milestones():
     assert found == ["Aha, the root cause is the stale cache."]
 
 
+def test_reasoning_preview_waits_for_useful_text_and_keeps_first_sentence():
+    assert reasoning_preview("I will inspect") is None
+    assert reasoning_preview("I will inspect src/gladiator/service.py first. Then I will run tests.") == (
+        "I will inspect src/gladiator/service.py first."
+    )
+
+
 def test_command_summary_hides_long_python_payload():
     command = "python3 -c \"" + ("print('lots of implementation detail');" * 30) + "\""
     assert summarize_shell_command(command) == "Running Python"
@@ -32,10 +42,40 @@ def test_command_summary_hides_long_python_payload():
 def test_command_summary_describes_common_gladiator_actions():
     assert summarize_shell_command("gladiator send /tmp/result.png") == "Sending result.png"
     assert summarize_shell_command("gladiator todo done 2") == "Updating task list"
-    assert summarize_shell_command("gladiator web search 'latest docs'") == "Searching the web"
+    assert summarize_shell_command("gladiator web search 'latest docs'") == "Searching web: latest docs"
+
+
+def test_command_summary_keeps_relevant_file_names():
+    crop = (
+        "python3 -c \"from PIL import Image; "
+        "Image.open('/tmp/run/.gladiator/inbox/comparison.png').save('/tmp/run/gladiator_square.png')\""
+    )
+    assert summarize_shell_command(crop) == "Processing inbox/comparison.png → run/gladiator_square.png"
+    assert summarize_shell_command("cat src/gladiator/service.py") == "Reading src/gladiator/service.py"
+    assert summarize_shell_command("uv run pytest tests/test_telegram_helpers.py") == (
+        "Testing tests/test_telegram_helpers.py"
+    )
 
 
 def test_command_summary_truncates_unknown_commands():
     summary = summarize_shell_command("custom-tool " + "x" * 300, max_chars=80)
     assert len(summary) <= 80
     assert summary.endswith("…")
+
+
+def test_final_progress_summary_preserves_observation_and_recent_results():
+    milestones = deque(
+        [
+            "💭 I will inspect the Telegram renderer first.",
+            "✓ Reading src/gladiator/service.py",
+            "✓ Testing tests/test_telegram_helpers.py",
+            "✓ Sent result.png",
+        ],
+        maxlen=5,
+    )
+    summary = GladiatorService._summary_items(milestones[0], milestones)
+    body = GladiatorService._final_progress_body("✓ Done", summary)
+    assert body.startswith("✓ Done\n💭 I will inspect the Telegram renderer first.")
+    assert "src/gladiator/service.py" in body
+    assert "tests/test_telegram_helpers.py" in body
+    assert "result.png" in body
