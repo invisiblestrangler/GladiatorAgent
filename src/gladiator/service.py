@@ -18,7 +18,7 @@ from gladiator.runtime.decision import DecisionBroker, DecisionRequest, Decision
 from gladiator.skills import SkillManager, user_explicitly_requested_skill_write
 from gladiator.telegram.bot import IncomingTask, TelegramBotRuntime
 from gladiator.telegram.renderer import markdown_to_telegram_html, split_markdown
-from gladiator.telegram.traces import TraceHighlighter
+from gladiator.telegram.traces import TraceHighlighter, summarize_shell_command
 from gladiator.webtools import WebTools
 
 console = Console()
@@ -140,6 +140,7 @@ class GladiatorService:
             self.environment.skill_write_authorized = user_explicitly_requested_skill_write(incoming.text)
             self._drain_event_queue()
             finished = asyncio.Event()
+            progress_final = "✓ Done"
             progress_message = await self.bot.client.send_message(
                 chat_id,
                 "<i>Working…</i>",
@@ -155,12 +156,17 @@ class GladiatorService:
                     image_paths=incoming.image_paths,
                     file_paths=incoming.file_paths,
                 )
+                status = str(result.get("exit_status") or "Finished")
                 submission = str(result.get("submission") or "").strip()
                 if not submission:
-                    status = str(result.get("exit_status") or "Finished")
                     submission = "Cancelled by user." if status == "Cancelled" else f"Gladiator stopped: {status}"
+                if status == "Cancelled":
+                    progress_final = "■ Stopped"
+                elif status not in {"Submitted", "Finished", "Success", "Completed"}:
+                    progress_final = f"⚠ {status}"
                 await self._send_markdown(chat_id, submission)
             except Exception as exc:
+                progress_final = "⚠ Error"
                 await self.bot.client.send_message(
                     chat_id,
                     f"<b>Gladiator error</b>\n<code>{html.escape(str(exc))}</code>",
@@ -175,6 +181,10 @@ class GladiatorService:
                         pass
                     except Exception as exc:
                         console.print(f"[yellow]Telegram progress task failed: {exc}[/yellow]")
+                try:
+                    await self.bot.client.edit_message_text(chat_id, progress_message_id, progress_final)
+                except Exception:
+                    pass
                 try:
                     await self.bot.client.edit_message_reply_markup(chat_id, progress_message_id, None)
                 except Exception:
@@ -214,7 +224,7 @@ class GladiatorService:
 
     async def _consume_events(self, chat_id: int, message_id: int, finished: asyncio.Event) -> None:
         highlighter = TraceHighlighter()
-        milestones: deque[str] = deque(maxlen=8)
+        milestones: deque[str] = deque(maxlen=5)
         verbose_reasoning = ""
         last_update = 0.0
         last_rendered = "<i>Working…</i>"
@@ -227,23 +237,32 @@ class GladiatorService:
 
             if event.kind == EventKind.REASONING_DELTA:
                 if self.config.runtime.trace_mode == "milestones":
-                    milestones.extend(highlighter.feed(event.text))
+                    for highlight in highlighter.feed(event.text):
+                        milestones.append(highlight[:220])
                 elif self.config.runtime.trace_mode == "verbose":
                     verbose_reasoning = (verbose_reasoning + event.text)[-1800:]
             elif event.kind == EventKind.TOOL_STARTED:
-                command = str(event.data.get("command", "")).replace("\n", " ")
-                milestones.append(f"▶ {command[:220]}")
+                summary = summarize_shell_command(str(event.data.get("command", "")))
+                milestones.append(f"▶ {summary}")
             elif event.kind == EventKind.TOOL_FINISHED:
+                summary = summarize_shell_command(str(event.data.get("command", "")))
                 rc = event.data.get("returncode")
-                milestones.append("✓ command finished" if rc == 0 else f"✗ command exited {rc}")
+                completed = f"✓ {summary}" if rc == 0 else f"✗ {summary}"
+                started = f"▶ {summary}"
+                if milestones and milestones[-1] == started:
+                    milestones[-1] = completed
+                else:
+                    milestones.append(completed)
             elif event.kind == EventKind.COMPACTION_STARTED:
                 milestones.append("🧠 Compacting working context…")
             elif event.kind == EventKind.COMPACTION_FINISHED:
                 milestones.append("✓ Context compacted; continuing")
             elif event.kind == EventKind.WARNING:
-                milestones.append(f"⚠ {event.text[:300]}")
+                milestones.append(f"⚠ {event.text[:220]}")
             elif event.kind == EventKind.ARTIFACT_READY:
-                await self._send_artifact(chat_id, Path(str(event.data["path"])), bool(event.data.get("is_image")))
+                path = Path(str(event.data["path"]))
+                await self._send_artifact(chat_id, path, bool(event.data.get("is_image")))
+                milestones.append(f"✓ Sent {path.name}")
 
             now = time.monotonic()
             if now - last_update < 0.55:
