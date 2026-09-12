@@ -21,7 +21,7 @@ jobs:
       GLADIATOR_TG_BOT: ${{ secrets.GLADIATOR_TG_BOT }}
       TG_USER_ID: ${{ secrets.TG_USER_ID }}
       E2E_BASE_URL: https://openrouter.ai/api/v1
-      E2E_MODEL: thinkingmachines/inkling:free
+      E2E_MODEL: dots-studio/dots-3-note-preview:free
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
