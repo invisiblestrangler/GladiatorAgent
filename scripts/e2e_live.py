@@ -57,6 +57,15 @@ async def run_once(*, api_key: str, bot_token: str, user_id: int, attempt: int) 
 
     service = ExtendedGladiatorService(config=config, config_path=config_path, workspace=workspace)
     service._loop = asyncio.get_running_loop()
+    final_outputs: list[str] = []
+    original_send_markdown = service._send_markdown
+
+    async def capture_and_send_markdown(chat_id: int, text: str) -> None:
+        final_outputs.append(text)
+        await original_send_markdown(chat_id, text)
+
+    service._send_markdown = capture_and_send_markdown  # type: ignore[method-assign]
+
     try:
         identity = await service.bot.client._call("getMe")
         if not isinstance(identity, dict) or not identity.get("id"):
@@ -78,6 +87,8 @@ async def run_once(*, api_key: str, bot_token: str, user_id: int, attempt: int) 
         )
         await service.handle_task(user_id, task)
 
+        if not final_outputs or final_outputs[-1].strip() != FINAL_SENTINEL:
+            raise RuntimeError("Agent final submission did not match the expected E2E sentinel")
         probe = workspace / "e2e_probe.txt"
         if not probe.exists() or probe.read_text(encoding="utf-8") != SENTINEL + "\n":
             raise RuntimeError("Agent tool loop did not create the expected sentinel file")
@@ -99,7 +110,7 @@ async def run_once(*, api_key: str, bot_token: str, user_id: int, attempt: int) 
 
         await service.bot.client.send_message(
             user_id,
-            "<b>Gladiator E2E PASS</b>\nTelegram ✓\nModel stream ✓\nBash tool loop ✓\nTODO ledger ✓\n/new archive + reset ✓",
+            "<b>Gladiator E2E PASS</b>\nTelegram ✓\nModel stream ✓\nFinal submission ✓\nBash tool loop ✓\nTODO ledger ✓\n/new archive + reset ✓",
         )
     finally:
         await service.bot.client.close()
