@@ -57,11 +57,11 @@ class TraceHighlighter:
 
 _FILE_RE = re.compile(
     r"(?<![\w.-])((?:(?:[A-Za-z]:)?[/~.]?)?(?:[\w@+,.=-]+/)*[\w@+,.=-]+\."
-    r"(?:py|md|json|ya?ml|toml|txt|log|png|jpe?g|webp|gif|pdf|html?|css|js|mjs|cjs|ts|tsx|jsx|"
+    r"(?:py|md|json|ya?ml|toml|txt|log|png|jpe?g|webp|gif|svg|pdf|html?|css|js|mjs|cjs|ts|tsx|jsx|"
     r"swift|rs|go|sh|bash|zsh|csv|xml|sql|ini|cfg|conf))(?![\w.-])",
     re.IGNORECASE,
 )
-_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"}
 
 
 def reasoning_preview(text: str, *, max_chars: int = 170, min_chars: int = 60) -> str | None:
@@ -159,6 +159,11 @@ def summarize_shell_command(command: str, *, max_chars: int = 120) -> str:
     if len(args) >= 2 and args[:2] == ["gladiator", "ask"]:
         return "Preparing a decision question"
 
+    # Shell redirection/heredoc commands often start with mkdir/printf/cat but the useful
+    # observation is the file being created, not the full payload (which may contain URLs).
+    if (">" in compact or ">>" in compact) and files:
+        return f"Writing {files[-1]}"
+
     if executable in {"python", "python3", "python3.11"}:
         image_files = [name for name in files if Path(name).suffix.lower() in _IMAGE_SUFFIXES]
         if len(image_files) >= 2:
@@ -216,8 +221,6 @@ def summarize_shell_command(command: str, *, max_chars: int = 120) -> str:
     if executable == "curl":
         return _with_extra_files("Calling HTTP endpoint for", files) if files else "Calling HTTP endpoint"
 
-    if (">" in compact or ">>" in compact) and files:
-        return f"Writing {files[-1]}"
     if files:
         return _with_extra_files(f"Running {Path(args[0]).name} on", files)
     if len(compact) <= max_chars:
