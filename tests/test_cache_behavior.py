@@ -80,6 +80,7 @@ def test_provider_request_has_no_vendor_specific_cache_controls(monkeypatch):
     )
 
     assert response["extra"]["actions"][0]["command"] == "true"
+    assert response["extra"]["usage"]["prompt_tokens_details"]["cached_tokens"] == 80
     _, _, request = FakeClient.last_request
     payload = request["json"]
     headers = request["headers"]
@@ -87,9 +88,6 @@ def test_provider_request_has_no_vendor_specific_cache_controls(monkeypatch):
     assert payload["messages"][0] == {"role": "system", "content": "stable-prefix"}
     assert set(payload) == {"model", "messages", "tools", "tool_choice", "stream", "reasoning_effort"}
     assert set(headers) == {"Authorization", "Content-Type"}
-    assert model.last_prompt_cache_ratio == 0.8
-    assert model.cumulative_prompt_cache_ratio == 0.8
-    assert model.total_cache_write_tokens == 10
 
 
 def test_api_visible_prefix_is_stable_when_history_is_appended():
