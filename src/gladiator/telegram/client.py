@@ -28,6 +28,15 @@ class TelegramClient:
             raise TelegramAPIError(f"{method} failed: {body}")
         return body.get("result")
 
+    async def set_my_commands(self, commands: list[tuple[str, str]]) -> bool:
+        payload = {
+            "commands": [
+                {"command": command.lstrip("/"), "description": description}
+                for command, description in commands
+            ]
+        }
+        return bool(await self._call("setMyCommands", payload))
+
     async def get_updates(self, *, offset: int | None = None, timeout: int = 30) -> list[dict[str, Any]]:
         payload: dict[str, Any] = {
             "timeout": timeout,
