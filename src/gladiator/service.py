@@ -18,7 +18,7 @@ from gladiator.runtime.decision import DecisionBroker, DecisionRequest, Decision
 from gladiator.skills import SkillManager, user_explicitly_requested_skill_write
 from gladiator.telegram.bot import IncomingTask, TelegramBotRuntime
 from gladiator.telegram.renderer import markdown_to_telegram_html, split_markdown
-from gladiator.telegram.traces import TraceHighlighter, summarize_shell_command
+from gladiator.telegram.traces import TraceHighlighter, reasoning_preview, summarize_shell_command
 from gladiator.webtools import WebTools
 
 console = Console()
@@ -141,6 +141,7 @@ class GladiatorService:
             self._drain_event_queue()
             finished = asyncio.Event()
             progress_final = "✓ Done"
+            progress_summary: list[str] = []
             progress_message = await self.bot.client.send_message(
                 chat_id,
                 "<i>Working…</i>",
@@ -176,13 +177,20 @@ class GladiatorService:
                 finished.set()
                 for task in (typing_task, event_task):
                     try:
-                        await task
+                        task_result = await task
+                        if task is event_task and isinstance(task_result, list):
+                            progress_summary = task_result
                     except asyncio.CancelledError:
                         pass
                     except Exception as exc:
                         console.print(f"[yellow]Telegram progress task failed: {exc}[/yellow]")
+                final_progress = self._final_progress_body(progress_final, progress_summary)
                 try:
-                    await self.bot.client.edit_message_text(chat_id, progress_message_id, progress_final)
+                    await self.bot.client.edit_message_text(
+                        chat_id,
+                        progress_message_id,
+                        markdown_to_telegram_html(final_progress),
+                    )
                 except Exception:
                     pass
                 try:
@@ -195,6 +203,12 @@ class GladiatorService:
     @staticmethod
     def _stop_reply_markup() -> dict:
         return {"inline_keyboard": [[{"text": "Stop", "callback_data": "gladiator:stop"}]]}
+
+    @staticmethod
+    def _final_progress_body(status: str, summary: list[str]) -> str:
+        if not summary:
+            return status
+        return status + "\n" + "\n".join(summary[:4])
 
     def _refresh_model_settings(self) -> None:
         provider = self.config.provider
@@ -222,10 +236,13 @@ class GladiatorService:
             except asyncio.TimeoutError:
                 continue
 
-    async def _consume_events(self, chat_id: int, message_id: int, finished: asyncio.Event) -> None:
+    async def _consume_events(self, chat_id: int, message_id: int, finished: asyncio.Event) -> list[str]:
         highlighter = TraceHighlighter()
         milestones: deque[str] = deque(maxlen=5)
         verbose_reasoning = ""
+        turn_preview_buffer = ""
+        turn_preview_emitted = False
+        first_activity_preview: str | None = None
         last_update = 0.0
         last_rendered = "<i>Working…</i>"
 
@@ -237,10 +254,24 @@ class GladiatorService:
 
             if event.kind == EventKind.REASONING_DELTA:
                 if self.config.runtime.trace_mode == "milestones":
+                    if not turn_preview_emitted:
+                        turn_preview_buffer += event.text
+                        preview = reasoning_preview(turn_preview_buffer)
+                        if preview:
+                            item = f"💭 {preview}"
+                            milestones.append(item)
+                            if first_activity_preview is None:
+                                first_activity_preview = item
+                            turn_preview_emitted = True
                     for highlight in highlighter.feed(event.text):
-                        milestones.append(highlight[:220])
+                        item = f"💡 {highlight[:210]}"
+                        if not milestones or milestones[-1] != item:
+                            milestones.append(item)
                 elif self.config.runtime.trace_mode == "verbose":
                     verbose_reasoning = (verbose_reasoning + event.text)[-1800:]
+            elif event.kind == EventKind.RESPONSE_FINISHED:
+                turn_preview_buffer = ""
+                turn_preview_emitted = False
             elif event.kind == EventKind.TOOL_STARTED:
                 summary = summarize_shell_command(str(event.data.get("command", "")))
                 milestones.append(f"▶ {summary}")
@@ -282,6 +313,23 @@ class GladiatorService:
                 last_update = now
             except Exception:
                 pass
+
+        return self._summary_items(first_activity_preview, milestones)
+
+    @staticmethod
+    def _summary_items(first_activity_preview: str | None, milestones: deque[str]) -> list[str]:
+        summary: list[str] = []
+        if first_activity_preview:
+            summary.append(first_activity_preview)
+        for item in milestones:
+            if item.startswith("▶ ") or item in summary:
+                continue
+            summary.append(item)
+        if len(summary) <= 4:
+            return summary
+        if first_activity_preview and summary[0] == first_activity_preview:
+            return [summary[0], *summary[-3:]]
+        return summary[-4:]
 
     def _draft_body(self, milestones: deque[str], verbose_reasoning: str) -> str:
         trace_mode = self.config.runtime.trace_mode
