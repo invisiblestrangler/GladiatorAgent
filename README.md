@@ -3,6 +3,182 @@
 GladiatorAgent is a lightweight, Telegram-first coding-agent runtime built on top of Stanford/SWE-agent's `mini-swe-agent`.
 The goal is Hermes-like usability on the go while preserving mini-swe-agent's small, coding-focused context footprint.
 
+You run Gladiator beside a local project, message it from Telegram, and let the agent inspect/edit/test the workspace using an OpenAI-compatible model endpoint. Telegram stays a UI rather than becoming agent memory.
+
+## Highlights
+
+- **Telegram-first coding agent** with image/file input and file/image return.
+- **Live, compact progress cards** with model-intent previews, filenames, tool targets, test status, and an inline Stop button.
+- **YOLO by default** for routine coding work.
+- **OpenAI-compatible and provider-agnostic** model transport.
+- **Configurable model and reasoning level** from Telegram.
+- **Persistent sessions** with `/new` for a clean conversational reset.
+- **Automatic context compaction** around 300k tokens, or earlier when required by the selected model window.
+- **External TODO ledger** for multi-step work without bloating model context.
+- **Explicit-only skills**: Gladiator never auto-learns or creates skills on its own.
+- **Optional SearXNG and browser automation** for web work.
+- **Context-bounded observations** so giant shell/web outputs stay on disk instead of flooding the prompt.
+
+## Install
+
+### Requirements
+
+You need:
+
+- macOS or Linux recommended; Windows should work anywhere the Python dependencies and shell environment are supported
+- Git
+- Python 3.11 or newer
+- [`uv`](https://docs.astral.sh/uv/)
+- a Telegram bot token
+- an OpenAI-compatible API endpoint, API key, and model ID
+
+Docker is **optional**. Gladiator only needs it if you choose the local SearXNG option during setup. Browser automation is also optional.
+
+### 1. Install `uv`
+
+macOS/Linux:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Then open a new shell, or make sure the directory printed by the installer is on your `PATH`.
+
+If you already have `uv`, skip this step.
+
+### 2. Install GladiatorAgent
+
+Install directly from GitHub:
+
+```bash
+uv tool install --python 3.11 git+https://github.com/invisiblestrangler/GladiatorAgent.git
+```
+
+Check it:
+
+```bash
+gladiator version
+```
+
+To upgrade later:
+
+```bash
+uv tool install --force --python 3.11 git+https://github.com/invisiblestrangler/GladiatorAgent.git
+```
+
+### 3. Create a Telegram bot
+
+In Telegram:
+
+1. Open **@BotFather**.
+2. Run `/newbot`.
+3. Choose a name and username.
+4. Copy the bot token BotFather gives you.
+
+You will paste this token into `gladiator setup`. Gladiator verifies the token before saving the configuration.
+
+### 4. Run the setup wizard
+
+```bash
+gladiator setup
+```
+
+The wizard asks for:
+
+- OpenAI-compatible endpoint — include `/v1` when your provider expects it
+- API key
+- model ID; Gladiator can try to fetch `/models` for you
+- reasoning level: `off`, `minimal`, `low`, `medium`, `high`, or `xhigh`
+- Telegram bot token
+- web search mode: none, local SearXNG, or an existing SearXNG instance
+- optional Docker installation when local SearXNG is selected and Docker is missing
+- optional isolated `browser-use` installation for heavier browser automation
+
+Secrets are stored in Gladiator's local user configuration and are not inserted into model context.
+
+### 5. Start Gladiator in your project
+
+From the repository/project you want Gladiator to work on:
+
+```bash
+cd /path/to/your/project
+gladiator run
+```
+
+The current directory is the workspace. You can also specify one explicitly:
+
+```bash
+gladiator run --workspace /path/to/your/project
+```
+
+Workspace-local runtime state is kept under:
+
+```text
+.gladiator/
+```
+
+That directory contains things such as the current trajectory, bounded tool-output files, uploaded Telegram attachments, TODO state, and compaction handoff data.
+
+### 6. Pair your Telegram account
+
+On the first run Gladiator prints a six-digit pairing code in the terminal.
+
+Open your bot in Telegram and send:
+
+```text
+/pair 123456
+```
+
+using the code printed by your Gladiator process.
+
+After pairing, simply send the bot a coding task. You can also attach an image or file with the request.
+
+A typical run looks like:
+
+```text
+Working…
+💭 I’ll inspect the auth middleware and its tests first.
+✓ Reading src/auth/middleware.py
+✓ Testing tests/test_auth.py
+
+↓ when finished
+
+✓ Done
+💭 I’ll inspect the auth middleware and its tests first.
+✓ Reading src/auth/middleware.py
+✓ Testing tests/test_auth.py
+```
+
+The separate final Telegram message contains the actual answer. Progress/UI text never becomes model memory.
+
+## Quick start
+
+If `uv` is already installed and you already have a Telegram bot token:
+
+```bash
+uv tool install --python 3.11 git+https://github.com/invisiblestrangler/GladiatorAgent.git
+gladiator setup
+cd /path/to/project
+gladiator run
+```
+
+Pair once from Telegram, then start sending tasks.
+
+## Telegram controls
+
+- `/start` or `/help` — show available controls
+- `/status` — provider/model/reasoning, approximate context size, local session, TODO count, and provider-reported prompt-cache metrics when available
+- `/model [id]` — show or change model
+- `/reasoning [off|minimal|low|medium|high|xhigh]`
+- `/trace [off|milestones|verbose]`
+- `/provider [endpoint] [api-key]` — show/change OpenAI-compatible provider; when a key is included Gladiator attempts to remove that Telegram message immediately
+- `/compact` — compact at the next safe agent boundary
+- `/new` — archive the current conversational state and start a clean session while keeping workspace files, skills, and settings
+- `/todo` — show the current external task ledger
+- `/stop` — stop the current run
+
+The default `milestones` trace mode is intended for normal use: enough information to observe what the model is doing without dumping its entire reasoning or shell transcript into Telegram.
+
 ## Design rules
 
 - **YOLO by default.** Routine commands, edits, tests, and implementation choices do not ask for confirmation.
@@ -13,42 +189,9 @@ The goal is Hermes-like usability on the go while preserving mini-swe-agent's sm
 - **300k compaction target.** The effective threshold is the smaller of 300k tokens or roughly 82% of the selected model's known context window.
 - **Cache-friendly history.** API-visible history is append-only within a session, keeps the system/tool prefix stable, and excludes UI/reasoning metadata. Gladiator does not inject provider-specific cache or routing controls.
 
-## Setup
-
-```bash
-uv tool install git+https://github.com/invisiblestrangler/GladiatorAgent
-
-gladiator setup
-gladiator run
-```
-
-The interactive setup wizard asks for:
-
-- OpenAI-compatible endpoint and API key
-- model and reasoning level
-- Telegram bot token
-- web search mode
-- optional local-only SearXNG
-- optional Docker installation when local SearXNG is selected and Docker is missing
-- optional `browser-use` installation for heavy browser automation
-
-No manual config-file editing is required.
-
-## Telegram controls
-
-- `/status` — provider/model/reasoning, approximate context size, local session, TODO count, and provider-reported prompt-cache metrics when available
-- `/model [id]` — show or change model
-- `/reasoning [off|minimal|low|medium|high|xhigh]`
-- `/trace [off|milestones|verbose]`
-- `/provider [endpoint] [api-key]` — show/change OpenAI-compatible provider
-- `/compact` — compact at the next safe agent boundary
-- `/new` — archive the current conversational state and start a clean session while keeping workspace files, skills, and settings
-- `/todo` — show the current external task ledger
-- `/stop` — stop the current run
-
 ## Sessions and caching
 
-Gladiator keeps the system prompt, tool schema, and previous API-visible messages byte-stable as a session grows. New information is appended at the tail instead of rewriting prior messages. Telegram/UI events, timestamps, reasoning traces, and `message.extra` metadata are not sent back to the model.
+Gladiator keeps the system prompt, tool schema, and previous API-visible messages stable as a session grows. New information is appended at the tail instead of rewriting prior messages. Telegram/UI events, timestamps, reasoning traces, and `message.extra` metadata are not sent back to the model.
 
 This is intentionally provider-agnostic: Gladiator does not send sticky-routing IDs, cache headers, provider-selection hints, or other vendor-specific cache controls. If a compatible backend implements prefix caching, it can reuse the stable prompt prefix naturally.
 
@@ -79,13 +222,43 @@ The agent is instructed to use this for multi-step work, keep it concise, and av
 - `gladiator web fetch URL` performs lightweight deterministic extraction.
 - Browser automation is optional and kept outside the core dependency set.
 - Uploaded files stay on disk instead of being automatically dumped into context.
-- Images can be supplied as multimodal input.
+- Images can be supplied as multimodal input when the selected model supports vision.
 - `gladiator send PATH` sends an image or file back through Telegram without exposing Telegram internals to the model.
 
 ## Skills
 
 Skills are lazy external memory. The agent sees names first and reads one relevant skill at a time. Skill creation/update/delete is runtime-locked unless the current user request explicitly asks to create or change a skill; there is no automatic learning or automatic skill creation.
 
-## Development status
+Agent-facing commands:
 
-The bootstrap runtime includes Telegram streaming and typing feedback, provider-agnostic OpenAI-compatible streaming, image/file transfer, provider/model/reasoning controls, context compaction, persistent sessions, provider-reported cache telemetry when available, the external TODO ledger, lazy explicit skills, SearXNG/web extraction, optional Browser Use installation, YOLO execution, and conservative one-hour escalation fallback.
+```bash
+gladiator skill list
+gladiator skill read NAME
+gladiator skill write NAME SOURCE_PATH
+gladiator skill delete NAME
+```
+
+Writes and deletes only succeed when the current user request explicitly authorizes a skill change.
+
+## Development
+
+Clone the repository and install the development dependencies:
+
+```bash
+git clone https://github.com/invisiblestrangler/GladiatorAgent.git
+cd GladiatorAgent
+uv sync --extra dev
+```
+
+Run tests and lint checks:
+
+```bash
+uv run pytest
+uv run ruff check src tests
+```
+
+The repository also includes a manual GitHub Actions Live E2E workflow for real model/Telegram testing. It is intentionally separate from normal CI so regular pull requests do not require provider or Telegram secrets.
+
+## Status
+
+GladiatorAgent currently includes Telegram progress/typing feedback, inline cancellation, provider-agnostic OpenAI-compatible streaming, image/file transfer, provider/model/reasoning controls, context compaction, persistent sessions, provider-reported cache telemetry when available, the external TODO ledger, lazy explicit skills, SearXNG/web extraction, optional Browser Use installation, YOLO execution, and conservative one-hour escalation fallback.
