@@ -2,6 +2,11 @@ name: Live E2E
 
 on:
   workflow_dispatch:
+  push:
+    branches: [feat/bootstrap-runtime]
+    paths:
+      - ".github/workflows/e2e-live.yml"
+      - "scripts/e2e_live.py"
 
 permissions:
   contents: read
