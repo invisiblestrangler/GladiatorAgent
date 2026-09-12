@@ -1,0 +1,37 @@
+name: Live E2E
+
+on:
+  workflow_dispatch:
+  # Temporary branch trigger so the bootstrap PR can prove the live path once.
+  # Remove this trigger after the first successful E2E; workflow_dispatch remains.
+  push:
+    branches: [feat/bootstrap-runtime]
+    paths:
+      - ".github/workflows/e2e-live.yml"
+      - "scripts/e2e_live.py"
+      - "src/**"
+      - "pyproject.toml"
+
+permissions:
+  contents: read
+
+jobs:
+  live-e2e:
+    runs-on: ubuntu-latest
+    environment: env
+    timeout-minutes: 20
+    env:
+      E2E_API_KEY: ${{ secrets.OPENROUTER_KEY }}
+      GLADIATOR_TG_BOT: ${{ secrets.GLADIATOR_TG_BOT }}
+      TG_USER_ID: ${{ secrets.TG_USER_ID }}
+      E2E_BASE_URL: https://openrouter.ai/api/v1
+      E2E_MODEL: nvidia/nemotron-3-ultra-550b-a55b:free
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+      - name: Install Gladiator
+        run: uv sync --extra dev
+      - name: Run live Telegram + agent E2E
+        run: uv run python scripts/e2e_live.py
