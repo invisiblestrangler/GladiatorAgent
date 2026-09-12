@@ -102,7 +102,7 @@ The wizard asks for:
 - optional Docker installation when local SearXNG is selected and Docker is missing
 - optional isolated `browser-use` installation for heavier browser automation
 
-Reasoning support is provider/model dependent. Gladiator exposes the full configured set and passes the selected value through to the OpenAI-compatible endpoint rather than artificially restricting higher levels.
+Reasoning effort is passed through to the selected OpenAI-compatible endpoint; individual providers/models may support only a subset of these values.
 
 Secrets are stored in Gladiator's local user configuration and are not inserted into model context.
 
@@ -248,13 +248,17 @@ The current conversation trajectory is persisted under `.gladiator/`, so a super
 
 Gladiator is intentionally provider-agnostic and uses the OpenAI-compatible chat-completions/tool-call contract rather than provider-specific routing or cache controls.
 
-For multi-turn tool work, Gladiator now validates the local transcript before every request. An assistant tool call must have a non-empty unique tool-call ID and must be followed by the matching `role: "tool"` result before the next assistant/user turn is sent upstream. If a streaming provider omits a tool-call ID, Gladiator generates a short unique `call_...` ID and uses the same ID for the matching tool result.
+For multi-turn tool work, Gladiator validates the local transcript before every request. An assistant tool call must have a non-empty unique tool-call ID and must be followed by the matching `role: "tool"` result before the next assistant/user turn is sent upstream. If a streaming provider omits a tool-call ID, Gladiator generates a short unique `call_...` ID and uses the same ID for the matching tool result.
+
+Terminal completion is also closed as a valid tool round trip. mini-swe signals `COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` by raising a terminal exception from inside tool execution; Gladiator records the corresponding `role: "tool"` observation before persisting the final submission so the next user request can continue the same session cleanly.
+
+Older Gladiator versions could save a successful completion as `assistant(tool_call) -> exit` without the matching tool observation. When continuing one of those specifically completed sessions, current Gladiator repairs that exact legacy terminal gap automatically before adding the next user turn. It does **not** fabricate tool results for crashes, cancellations, or unrelated malformed history.
 
 This catches malformed or poisoned tool history locally instead of repeatedly sending a transcript that a stricter compatible endpoint will reject.
 
 When a provider returns HTTP 4xx/5xx, Gladiator preserves a **sanitized provider error body** and surfaces request/provider metadata when the endpoint supplies it. Telegram should therefore show the actual provider reason instead of only a generic `httpx` error and documentation link.
 
-If a session was created by an older Gladiator version and starts failing immediately after a tool call, update Gladiator, restart the service, then use `/new` once to discard the old conversational transcript while keeping workspace files, skills, and settings:
+If a genuinely malformed session from an older version still fails local transcript validation, update Gladiator, restart the service, then use `/new` once to discard the old conversational transcript while keeping workspace files, skills, and settings:
 
 ```bash
 uv tool install --force --python 3.11 git+https://github.com/invisiblestrangler/GladiatorAgent.git
@@ -267,7 +271,7 @@ Then in Telegram:
 /new
 ```
 
-If the provider still rejects a valid tool round trip, the new error message should contain the provider's actionable detail and, when available, a request ID. That information is the right starting point for diagnosing endpoint-specific incompatibilities.
+If the provider still rejects a valid tool round trip, the error message should contain the provider's actionable detail and, when available, a request ID. That information is the right starting point for diagnosing endpoint-specific incompatibilities.
 
 Telegram link previews are disabled for Gladiator progress/final bot messages by default, and long compound shell commands are summarized into useful labels such as `Writing project/output.svg` rather than exposing embedded URLs or dumping full heredocs into the chat.
 
@@ -353,4 +357,4 @@ The repository also includes a manual GitHub Actions Live E2E workflow for real 
 
 ## Status
 
-GladiatorAgent currently includes the native Telegram command menu, supervised background-service support, Telegram progress/typing feedback, inline cancellation, strict local tool-transcript validation, provider error-body diagnostics, provider-agnostic OpenAI-compatible streaming, image/file transfer, provider/model/reasoning controls, context compaction, persistent sessions, provider-reported cache telemetry when available, the external TODO ledger, lazy explicit skills, SearXNG/web extraction, optional Browser Use installation, YOLO execution, and conservative one-hour escalation fallback.
+GladiatorAgent currently includes the native Telegram command menu, supervised background-service support, Telegram progress/typing feedback, inline cancellation, strict local tool-transcript validation with terminal completion repair, provider error-body diagnostics, provider-agnostic OpenAI-compatible streaming, image/file transfer, provider/model/reasoning controls, context compaction, persistent sessions, provider-reported cache telemetry when available, the external TODO ledger, lazy explicit skills, SearXNG/web extraction, optional Browser Use installation, YOLO execution, and conservative one-hour escalation fallback.
