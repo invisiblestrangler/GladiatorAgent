@@ -8,7 +8,9 @@ You run Gladiator beside a local project, message it from Telegram, and let the 
 ## Highlights
 
 - **Telegram-first coding agent** with image/file input and file/image return.
+- **Native Telegram command menu** registered automatically, so typing `/` shows the available controls.
 - **Live, compact progress cards** with model-intent previews, filenames, tool targets, test status, and an inline Stop button.
+- **Supervised background mode** with automatic restart after failures and autostart on Linux reboot / macOS login.
 - **YOLO by default** for routine coding work.
 - **OpenAI-compatible and provider-agnostic** model transport.
 - **Configurable model and reasoning level** from Telegram.
@@ -25,7 +27,7 @@ You run Gladiator beside a local project, message it from Telegram, and let the 
 
 You need:
 
-- macOS or Linux recommended; Windows should work anywhere the Python dependencies and shell environment are supported
+- macOS or Linux recommended; Windows should work for foreground use anywhere the Python dependencies and shell environment are supported
 - Git
 - Python 3.11 or newer
 - [`uv`](https://docs.astral.sh/uv/)
@@ -66,6 +68,12 @@ To upgrade later:
 uv tool install --force --python 3.11 git+https://github.com/invisiblestrangler/GladiatorAgent.git
 ```
 
+If Gladiator is installed as a background service, restart it after upgrading:
+
+```bash
+gladiator service restart
+```
+
 ### 3. Create a Telegram bot
 
 In Telegram:
@@ -96,7 +104,7 @@ The wizard asks for:
 
 Secrets are stored in Gladiator's local user configuration and are not inserted into model context.
 
-### 5. Start Gladiator in your project
+### 5. Start Gladiator once in the foreground
 
 From the repository/project you want Gladiator to work on:
 
@@ -111,6 +119,8 @@ The current directory is the workspace. You can also specify one explicitly:
 gladiator run --workspace /path/to/your/project
 ```
 
+`gladiator run` is intentionally the foreground/debug command. It stays attached to the terminal until you stop it with Ctrl-C.
+
 Workspace-local runtime state is kept under:
 
 ```text
@@ -121,7 +131,7 @@ That directory contains things such as the current trajectory, bounded tool-outp
 
 ### 6. Pair your Telegram account
 
-On the first run Gladiator prints a six-digit pairing code in the terminal.
+On the first foreground run Gladiator prints a six-digit pairing code in the terminal.
 
 Open your bot in Telegram and send:
 
@@ -132,6 +142,8 @@ Open your bot in Telegram and send:
 using the code printed by your Gladiator process.
 
 After pairing, simply send the bot a coding task. You can also attach an image or file with the request.
+
+Gladiator registers its native Telegram command menu every time the bot starts. After the bot is online, typing `/` in Telegram shows commands such as `/status`, `/model`, `/reasoning`, `/new`, `/todo`, and `/stop`.
 
 A typical run looks like:
 
@@ -151,6 +163,37 @@ Working…
 
 The separate final Telegram message contains the actual answer. Progress/UI text never becomes model memory.
 
+### 7. Install the persistent background service (recommended)
+
+Once pairing works, stop the foreground process with Ctrl-C and install the supervised service from the project workspace:
+
+```bash
+cd /path/to/your/project
+gladiator service install
+```
+
+Or provide the workspace explicitly:
+
+```bash
+gladiator service install --workspace /path/to/your/project
+```
+
+On **Linux**, Gladiator uses systemd. The service is enabled for automatic startup and uses `Restart=on-failure`. For a non-root user Gladiator also enables systemd lingering so it can start after reboot without an interactive login. If the host requires elevated permission to enable lingering, Gladiator prints the exact `sudo loginctl enable-linger ...` command required.
+
+On **macOS**, Gladiator installs a LaunchAgent with `RunAtLoad` and restart-on-failure behavior. It starts automatically when that user logs in after reboot.
+
+Manage the service with:
+
+```bash
+gladiator service status
+gladiator service restart
+gladiator service stop
+gladiator service start
+gladiator service uninstall
+```
+
+So normal usage is background/supervised; `gladiator run` remains useful when you want foreground logs or are debugging setup.
+
 ## Quick start
 
 If `uv` is already installed and you already have a Telegram bot token:
@@ -162,9 +205,17 @@ cd /path/to/project
 gladiator run
 ```
 
-Pair once from Telegram, then start sending tasks.
+Pair once from Telegram, press Ctrl-C, then make it persistent:
+
+```bash
+gladiator service install
+```
+
+After that, the service runs independently of your shell and is supervised by the operating system.
 
 ## Telegram controls
+
+Typing `/` in Telegram displays the registered command list while Gladiator is running.
 
 - `/start` or `/help` — show available controls
 - `/status` — provider/model/reasoning, approximate context size, local session, TODO count, and provider-reported prompt-cache metrics when available
@@ -178,6 +229,18 @@ Pair once from Telegram, then start sending tasks.
 - `/stop` — stop the current run
 
 The default `milestones` trace mode is intended for normal use: enough information to observe what the model is doing without dumping its entire reasoning or shell transcript into Telegram.
+
+## Background service behavior
+
+Gladiator does not hide a second internal "gateway" process. The long-running Telegram/model runtime is the process managed by systemd or launchd.
+
+- `gladiator run` — foreground process; closing the shell/process stops it.
+- `gladiator service install` — installs and starts the supervised background process.
+- Linux systemd service — starts after reboot and restarts after unexpected failures.
+- macOS LaunchAgent — starts at user login and restarts after unexpected failures.
+- Planned/manual stops are respected; the supervisor does not immediately resurrect a service that you intentionally stopped through the service manager.
+
+The current conversation trajectory is persisted under `.gladiator/`, so a supervised process restart restores the saved agent session rather than intentionally creating a new one.
 
 ## Design rules
 
@@ -261,4 +324,4 @@ The repository also includes a manual GitHub Actions Live E2E workflow for real 
 
 ## Status
 
-GladiatorAgent currently includes Telegram progress/typing feedback, inline cancellation, provider-agnostic OpenAI-compatible streaming, image/file transfer, provider/model/reasoning controls, context compaction, persistent sessions, provider-reported cache telemetry when available, the external TODO ledger, lazy explicit skills, SearXNG/web extraction, optional Browser Use installation, YOLO execution, and conservative one-hour escalation fallback.
+GladiatorAgent currently includes the native Telegram command menu, supervised background-service support, Telegram progress/typing feedback, inline cancellation, provider-agnostic OpenAI-compatible streaming, image/file transfer, provider/model/reasoning controls, context compaction, persistent sessions, provider-reported cache telemetry when available, the external TODO ledger, lazy explicit skills, SearXNG/web extraction, optional Browser Use installation, YOLO execution, and conservative one-hour escalation fallback.
