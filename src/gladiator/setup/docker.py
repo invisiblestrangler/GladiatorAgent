@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -26,15 +27,24 @@ class DockerManager:
             command = ["brew", "install", "--cask", "docker"]
         elif sys.platform.startswith("linux"):
             if shutil.which("apt-get"):
-                command = ["sudo", "apt-get", "install", "-y", "docker.io", "docker-compose-v2"]
+                command = ["apt-get", "install", "-y", "docker.io"]
             elif shutil.which("dnf"):
-                command = ["sudo", "dnf", "install", "-y", "docker", "docker-compose-plugin"]
+                command = ["dnf", "install", "-y", "docker"]
             elif shutil.which("pacman"):
-                command = ["sudo", "pacman", "-S", "--noconfirm", "docker", "docker-compose"]
+                command = ["pacman", "-S", "--noconfirm", "docker"]
             else:
                 raise RuntimeError("Automatic Docker installation is not supported on this Linux distribution")
         else:
             raise RuntimeError(f"Automatic Docker installation is not supported on {sys.platform}")
 
+        if sys.platform.startswith("linux") and os.geteuid() != 0:
+            if not shutil.which("sudo"):
+                raise RuntimeError("Docker installation requires root privileges or sudo")
+            command = ["sudo", *command]
         proc = subprocess.run(command, check=False)
+        if proc.returncode == 0 and sys.platform.startswith("linux"):
+            starter = ["systemctl", "enable", "--now", "docker"] if shutil.which("systemctl") else ["service", "docker", "start"]
+            if os.geteuid() != 0 and shutil.which("sudo"):
+                starter = ["sudo", *starter]
+            subprocess.run(starter, check=False)
         return CommandResult(command=command, returncode=proc.returncode)

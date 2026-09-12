@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import secrets
 import subprocess
+import time
 from pathlib import Path
 
+import httpx
 import yaml
 
 
@@ -60,3 +62,19 @@ class SearxngManager:
             self.image,
         ]
         subprocess.run(command, check=True)
+        self.wait_until_ready()
+
+    def wait_until_ready(self, timeout_seconds: float = 30.0) -> None:
+        deadline = time.monotonic() + timeout_seconds
+        last_error: Exception | None = None
+        while time.monotonic() < deadline:
+            try:
+                response = httpx.get(
+                    f"{self.url}/search", params={"q": "gladiator setup check", "format": "json"}, timeout=3.0
+                )
+                if response.status_code == 200:
+                    return
+            except Exception as exc:
+                last_error = exc
+            time.sleep(1.0)
+        raise RuntimeError(f"SearXNG did not become ready within {timeout_seconds:.0f}s: {last_error or 'no HTTP 200'}")

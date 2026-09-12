@@ -35,6 +35,7 @@ class SearchConfig(BaseModel):
 class BrowserConfig(BaseModel):
     enabled: bool = False
     backend: Literal["browser-use"] = "browser-use"
+    command: str | None = None
 
 
 class RuntimeConfig(BaseModel):

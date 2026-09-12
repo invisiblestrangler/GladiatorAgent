@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
+
 import typer
 from rich.console import Console
 
 from gladiator import __version__
 from gladiator.config import config_path, load_config
+from gladiator.service import GladiatorService
 from gladiator.setup.wizard import run_setup
 
 app = typer.Typer(no_args_is_help=True, help="GladiatorAgent — a Telegram-first mini-swe-agent runtime")
@@ -37,13 +41,20 @@ def status() -> None:
 
 
 @app.command()
-def run() -> None:
-    """Start Gladiator (Telegram runtime wiring is under active development)."""
+def run(
+    workspace: Path = typer.Option(Path.cwd(), "--workspace", "-w", help="Workspace the coding agent can access"),
+) -> None:
+    """Start the Telegram-connected Gladiator runtime."""
     path = config_path()
     if not path.exists():
         console.print("[yellow]Gladiator is not configured yet. Starting setup.[/yellow]")
         run_setup()
-    console.print("[yellow]Telegram runtime wiring is not enabled in this bootstrap slice yet.[/yellow]")
+    config = load_config(path)
+    service = GladiatorService(config=config, config_path=path, workspace=workspace)
+    try:
+        asyncio.run(service.run_forever())
+    except KeyboardInterrupt:
+        console.print("\nStopped Gladiator.")
 
 
 @app.command()

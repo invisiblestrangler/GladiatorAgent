@@ -51,7 +51,7 @@ def _choose_model(base_url: str, api_key: str) -> str:
     if typer.confirm("Fetch available models from the endpoint?", default=True):
         try:
             models = _fetch_models(base_url, api_key)
-        except Exception as exc:
+        except Exception as exc:  # setup should stay usable with nonstandard OpenAI-compatible endpoints
             console.print(f"[yellow]Could not list models: {exc}[/yellow]")
         else:
             if models:
@@ -87,16 +87,16 @@ def run_setup(*, destination: Path | None = None) -> Path:
         if not typer.confirm(f"Telegram verification failed ({exc}). Save configuration anyway?", default=False):
             raise typer.Abort()
 
-    search_mode = typer.prompt("Web search (none/local/existing)", default="local").strip().lower()
+    search_mode = typer.prompt(
+        "Web search (none/local/existing)",
+        default="local",
+    ).strip().lower()
     if search_mode not in {"none", "local", "existing"}:
         raise typer.BadParameter("Choose none, local, or existing")
 
     search = SearchConfig()
     if search_mode == "existing":
-        search = SearchConfig(
-            mode="existing_searxng",
-            searxng_url=typer.prompt("Existing SearXNG URL").rstrip("/"),
-        )
+        search = SearchConfig(mode="existing_searxng", searxng_url=typer.prompt("Existing SearXNG URL").rstrip("/"))
     elif search_mode == "local":
         if not DockerManager.available():
             if typer.confirm("Docker is not installed. Install Docker now?", default=True):
@@ -104,9 +104,7 @@ def run_setup(*, destination: Path | None = None) -> Path:
                 if result.returncode != 0:
                     console.print("[red]Docker installation failed; continuing without local search.[/red]")
                 elif not DockerManager.available():
-                    console.print(
-                        "[yellow]Docker was installed but is not yet available in this shell. Re-run setup later.[/yellow]"
-                    )
+                    console.print("[yellow]Docker was installed but is not yet available in this shell. Re-run setup later.[/yellow]")
             else:
                 console.print("[yellow]Skipping local SearXNG because Docker is unavailable.[/yellow]")
         if DockerManager.available():
@@ -123,11 +121,11 @@ def run_setup(*, destination: Path | None = None) -> Path:
     browser = BrowserConfig(enabled=False)
     if typer.confirm("Install optional local browser automation (browser-use)?", default=False):
         try:
-            install_browser_use()
+            browser_command = install_browser_use()
         except Exception as exc:
             console.print(f"[yellow]Browser automation install failed: {exc}[/yellow]")
         else:
-            browser = BrowserConfig(enabled=True)
+            browser = BrowserConfig(enabled=True, command=browser_command)
             console.print("[green]browser-use installed.[/green]")
 
     config = GladiatorConfig(
