@@ -8,7 +8,17 @@ from typing import Literal
 from platformdirs import user_config_dir, user_data_dir
 from pydantic import BaseModel, Field, SecretStr
 
-ReasoningEffort = Literal["off", "minimal", "low", "medium", "high", "xhigh"]
+ReasoningEffort = Literal["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+REASONING_EFFORTS: tuple[ReasoningEffort, ...] = (
+    "off",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+)
 TraceMode = Literal["off", "milestones", "verbose"]
 SearchMode = Literal["none", "local_searxng", "existing_searxng"]
 
