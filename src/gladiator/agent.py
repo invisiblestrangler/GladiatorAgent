@@ -14,6 +14,7 @@ SYSTEM_TEMPLATE = GLADIATOR_RUNTIME_POLICY + r"""
 
 You can interact with the computer through the bash tool. Work autonomously until the user's task is complete.
 Use targeted inspection rather than dumping large files. Execute one focused action at a time and verify changes with tests.
+During working turns, keep assistant prose minimal and tool-focused. Reserve the polished user-facing answer for the final submission instead of narrating the same answer before tools and again afterward.
 For lightweight public-web research, use `gladiator web search QUERY` and `gladiator web fetch URL` as sole bash commands. Prefer these over browser automation.
 For multi-step work, keep a concise external task ledger with `gladiator todo show`, `gladiator todo add '...'`, and `gladiator todo done ID`. Do not create TODOs for trivial one-step tasks, and do not paste the whole ledger into ordinary messages.
 User-created skills are lazy external memory. Use `gladiator skill list` to see names and `gladiator skill read NAME` only when a listed skill is relevant. Never read all skills by default.
