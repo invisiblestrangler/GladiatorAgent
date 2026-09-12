@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from gladiator.events import AgentEvent, EventKind, EventSink, null_event_sink
-from gladiator.runtime.prompt import GLADIATOR_RUNTIME_POLICY
 from minisweagent.agents.default import AgentConfig, DefaultAgent
 from minisweagent.exceptions import FormatError, InterruptAgentFlow, LimitsExceeded, TimeExceeded
+
+from gladiator.events import AgentEvent, EventKind, EventSink, null_event_sink
+from gladiator.runtime.prompt import GLADIATOR_RUNTIME_POLICY
 
 
 SYSTEM_TEMPLATE = GLADIATOR_RUNTIME_POLICY + r"""
@@ -14,6 +15,7 @@ SYSTEM_TEMPLATE = GLADIATOR_RUNTIME_POLICY + r"""
 You can interact with the computer through the bash tool. Work autonomously until the user's task is complete.
 Use targeted inspection rather than dumping large files. Execute one focused action at a time and verify changes with tests.
 For lightweight public-web research, use `gladiator web search QUERY` and `gladiator web fetch URL` as sole bash commands. Prefer these over browser automation.
+For multi-step work, keep a concise external task ledger with `gladiator todo show`, `gladiator todo add '...'`, and `gladiator todo done ID`. Do not create TODOs for trivial one-step tasks, and do not paste the whole ledger into ordinary messages.
 User-created skills are lazy external memory. Use `gladiator skill list` to see names and `gladiator skill read NAME` only when a listed skill is relevant. Never read all skills by default.
 Only when the CURRENT user request explicitly asks you to create or change a skill may you write a skill: first create a SKILL.md candidate in the workspace, then call `gladiator skill write NAME PATH` as the sole bash command. The runtime enforces this permission.
 To send a generated image or file to the user, call bash with `gladiator send PATH` as the sole command.
@@ -47,6 +49,7 @@ Write a concise but complete Markdown handoff for YOUR future self. Preserve onl
 - exact unfinished work and next actions
 - anything that must not be repeated or forgotten
 
+If the task is multi-step, make sure the external `gladiator todo` ledger is current before finishing compaction. Do not duplicate the full TODO ledger into the handoff unless an item needs explanation.
 Do not include generic narration, Telegram/UI state, typing/progress messages, or other transport metadata.
 The file is working memory, not a transcript. Write it using a bash command, then continue only after it exists.
 """.strip()
@@ -239,7 +242,9 @@ class GladiatorAgent(DefaultAgent):
                 role="user",
                 content=(
                     "Context was compacted. Resume the unfinished work. First read the working-memory file with bash:\n"
-                    f"{path.resolve()}\nDo not ask the user to repeat information preserved there."
+                    f"{path.resolve()}\n"
+                    "If this is multi-step work, also inspect the external task ledger with `gladiator todo show`. "
+                    "Do not ask the user to repeat information preserved there."
                 ),
             ),
         ]
