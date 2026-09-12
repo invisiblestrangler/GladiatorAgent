@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 
+import pytest
+from minisweagent.exceptions import FormatError, Submitted
+
 from gladiator.cache_session import CacheStats
 from gladiator.models.openai_streaming import OpenAICompatibleStreamingModel
 from gladiator.runtime.session import load_or_create_session, rotate_session
@@ -64,6 +67,22 @@ class FakeClient:
         return FakeResponse()
 
 
+class FakeTextResponse(FakeResponse):
+    def iter_lines(self):
+        chunk = {
+            "choices": [{"delta": {"content": "Finished cleanly."}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 50},
+        }
+        yield "data: " + json.dumps(chunk)
+        yield "data: [DONE]"
+
+
+class FakeTextClient(FakeClient):
+    def stream(self, method, url, **kwargs):
+        type(self).last_request = (method, url, kwargs)
+        return FakeTextResponse()
+
+
 def test_provider_request_has_no_vendor_specific_cache_controls(monkeypatch):
     monkeypatch.setattr("gladiator.models.openai_streaming.httpx.Client", FakeClient)
     model = OpenAICompatibleStreamingModel(
@@ -88,6 +107,51 @@ def test_provider_request_has_no_vendor_specific_cache_controls(monkeypatch):
     assert payload["messages"][0] == {"role": "system", "content": "stable-prefix"}
     assert set(payload) == {"model", "messages", "tools", "tool_choice", "stream", "reasoning_effort"}
     assert set(headers) == {"Authorization", "Content-Type"}
+
+
+def test_text_only_response_after_tool_work_is_final_submission(monkeypatch):
+    monkeypatch.setattr("gladiator.models.openai_streaming.httpx.Client", FakeTextClient)
+    model = OpenAICompatibleStreamingModel(
+        base_url="https://example.invalid/v1",
+        api_key="test-key",
+        model_name="test/model",
+    )
+    history = [
+        {"role": "system", "content": "stable-prefix"},
+        {"role": "user", "content": "do the work"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}],
+            "extra": {"actions": [{"command": "true", "tool_call_id": "call-1"}]},
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "ok"},
+    ]
+
+    with pytest.raises(Submitted) as submitted:
+        model.query(history)
+
+    message = submitted.value.messages[0]
+    assert message["role"] == "exit"
+    assert message["extra"]["exit_status"] == "Submitted"
+    assert message["extra"]["submission"] == "Finished cleanly."
+
+
+def test_text_only_response_before_any_tool_work_remains_format_error(monkeypatch):
+    monkeypatch.setattr("gladiator.models.openai_streaming.httpx.Client", FakeTextClient)
+    model = OpenAICompatibleStreamingModel(
+        base_url="https://example.invalid/v1",
+        api_key="test-key",
+        model_name="test/model",
+    )
+
+    with pytest.raises(FormatError):
+        model.query(
+            [
+                {"role": "system", "content": "stable-prefix"},
+                {"role": "user", "content": "do the work"},
+            ]
+        )
 
 
 def test_api_visible_prefix_is_stable_when_history_is_appended():
