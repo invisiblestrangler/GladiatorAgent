@@ -7,7 +7,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from threading import Event
+from threading import Event, Timer
 from typing import Any
 
 import httpx
@@ -28,11 +28,13 @@ class ProviderRequestError(RuntimeError):
         detail: str,
         request_id: str = "",
         provider_family: str = "",
+        retry_after_seconds: float | None = None,
     ) -> None:
         self.status_code = status_code
         self.detail = detail
         self.request_id = request_id
         self.provider_family = provider_family
+        self.retry_after_seconds = retry_after_seconds
         parts = [f"Provider HTTP {status_code}: {detail}"]
         metadata: list[str] = []
         if provider_family:
@@ -42,6 +44,14 @@ class ProviderRequestError(RuntimeError):
         if metadata:
             parts.append("(" + ", ".join(metadata) + ")")
         super().__init__(" ".join(parts))
+
+
+class ProviderTransportError(RuntimeError):
+    """Network/stream transport failure with enough state to decide whether replay is safe."""
+
+    def __init__(self, detail: str, *, stream_started: bool) -> None:
+        self.stream_started = stream_started
+        super().__init__(detail)
 
 
 class ToolTranscriptError(RuntimeError):
@@ -67,6 +77,9 @@ class OpenAICompatibleStreamingModel:
         cancel_event: Event | None = None,
         observation_template: str | None = None,
         format_error_template: str | None = None,
+        max_retries: int = 2,
+        retry_base_seconds: float = 1.5,
+        slow_stream_notice_seconds: float = 12.0,
     ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -75,6 +88,9 @@ class OpenAICompatibleStreamingModel:
         self.event_sink = event_sink
         self.timeout_seconds = timeout_seconds
         self.cancel_event = cancel_event
+        self.max_retries = max(0, int(max_retries))
+        self.retry_base_seconds = max(0.0, float(retry_base_seconds))
+        self.slow_stream_notice_seconds = max(0.0, float(slow_stream_notice_seconds))
         self.observation_template = observation_template or (
             "{% if output.exception_info %}<exception>{{output.exception_info}}</exception>\n{% endif %}"
             "<returncode>{{output.returncode}}</returncode>\n<output>\n{{output.output}}</output>"
@@ -159,47 +175,171 @@ class OpenAICompatibleStreamingModel:
         if self.reasoning_effort != "off":
             payload["reasoning_effort"] = self.reasoning_effort
 
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            self._raise_if_cancelled()
+            try:
+                result = self._query_once(payload, attempt=attempt)
+            except ProviderRequestError as exc:
+                last_error = exc
+                if attempt >= self.max_retries or not self._is_retryable_provider_error(exc):
+                    raise
+                delay = self._retry_delay(attempt, exc.retry_after_seconds)
+                self.event_sink(
+                    AgentEvent(
+                        EventKind.STATUS,
+                        f"↻ Provider rejected the request; retrying {attempt + 1}/{self.max_retries} in {delay:.1f}s…",
+                        {"retry": attempt + 1, "max_retries": self.max_retries, "status_code": exc.status_code},
+                    )
+                )
+                self._sleep_with_cancel(delay)
+                continue
+            except ProviderTransportError as exc:
+                last_error = exc
+                if exc.stream_started or attempt >= self.max_retries:
+                    raise
+                delay = self._retry_delay(attempt, None)
+                self.event_sink(
+                    AgentEvent(
+                        EventKind.STATUS,
+                        f"↻ Provider connection failed; retrying {attempt + 1}/{self.max_retries} in {delay:.1f}s…",
+                        {"retry": attempt + 1, "max_retries": self.max_retries},
+                    )
+                )
+                self._sleep_with_cancel(delay)
+                continue
+
+            if attempt:
+                self.event_sink(
+                    AgentEvent(
+                        EventKind.STATUS,
+                        f"✓ Provider retry succeeded on attempt {attempt + 1}",
+                        {"retry_succeeded": True, "attempt": attempt + 1},
+                    )
+                )
+            return self._assemble_result(messages, *result)
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Provider request failed without an error")
+
+    def _query_once(
+        self,
+        payload: dict[str, Any],
+        *,
+        attempt: int,
+    ) -> tuple[list[str], list[str], dict[int, dict[str, Any]], str | None, dict[str, Any]]:
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         tool_calls: dict[int, dict[str, Any]] = {}
         finish_reason: str | None = None
         usage: dict[str, Any] = {}
+        stream_started = False
+        request_started = time.monotonic()
+        slow_notice_sent = Event()
+
+        def slow_notice() -> None:
+            if stream_started or self.cancel_event is not None and self.cancel_event.is_set():
+                return
+            slow_notice_sent.set()
+            elapsed = max(1, int(time.monotonic() - request_started))
+            self.event_sink(
+                AgentEvent(
+                    EventKind.STATUS,
+                    f"⏳ Still waiting for the model to start streaming… {elapsed}s",
+                    {"slow_stream": True, "ephemeral": True, "attempt": attempt + 1, "elapsed_seconds": elapsed},
+                )
+            )
+
+        timer: Timer | None = None
+        if self.slow_stream_notice_seconds > 0:
+            timer = Timer(self.slow_stream_notice_seconds, slow_notice)
+            timer.daemon = True
+            timer.start()
 
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         timeout = httpx.Timeout(self.timeout_seconds, connect=min(30.0, self.timeout_seconds))
-        with httpx.Client(timeout=timeout) as client:
-            with client.stream("POST", f"{self.base_url}/chat/completions", headers=headers, json=payload) as response:
-                self._raise_provider_http_error(response)
-                for line in response.iter_lines():
-                    self._raise_if_cancelled()
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data)
-                    except json.JSONDecodeError:
-                        self.event_sink(AgentEvent(EventKind.WARNING, "Provider emitted an invalid SSE JSON chunk."))
-                        continue
-                    if isinstance(chunk.get("usage"), dict):
-                        usage = chunk["usage"]
-                    choices = chunk.get("choices") or []
-                    if not choices:
-                        continue
-                    choice = choices[0]
-                    finish_reason = choice.get("finish_reason") or finish_reason
-                    delta = choice.get("delta") or {}
-                    text = delta.get("content")
-                    if isinstance(text, str) and text:
-                        content_parts.append(text)
-                        self.event_sink(AgentEvent(EventKind.TEXT_DELTA, text))
-                    reasoning = self._extract_reasoning_delta(delta)
-                    if reasoning:
-                        reasoning_parts.append(reasoning)
-                        self.event_sink(AgentEvent(EventKind.REASONING_DELTA, reasoning))
-                    self._merge_tool_call_deltas(tool_calls, delta.get("tool_calls") or [])
+        try:
+            try:
+                with httpx.Client(timeout=timeout) as client:
+                    with client.stream(
+                        "POST",
+                        f"{self.base_url}/chat/completions",
+                        headers=headers,
+                        json=payload,
+                    ) as response:
+                        self._raise_provider_http_error(response)
+                        for line in response.iter_lines():
+                            self._raise_if_cancelled()
+                            if not line or not line.startswith("data:"):
+                                continue
+                            data = line[5:].strip()
+                            if data == "[DONE]":
+                                break
+                            if not stream_started:
+                                stream_started = True
+                                if timer is not None:
+                                    timer.cancel()
+                                if slow_notice_sent.is_set():
+                                    elapsed = max(1, int(time.monotonic() - request_started))
+                                    self.event_sink(
+                                        AgentEvent(
+                                            EventKind.STATUS,
+                                            f"✓ Model started streaming after {elapsed}s",
+                                            {"slow_stream_recovered": True, "replace_slow_stream": True},
+                                        )
+                                    )
+                            try:
+                                chunk = json.loads(data)
+                            except json.JSONDecodeError:
+                                self.event_sink(
+                                    AgentEvent(EventKind.WARNING, "Provider emitted an invalid SSE JSON chunk.")
+                                )
+                                continue
+                            if isinstance(chunk.get("usage"), dict):
+                                usage = chunk["usage"]
+                            choices = chunk.get("choices") or []
+                            if not choices:
+                                continue
+                            choice = choices[0]
+                            finish_reason = choice.get("finish_reason") or finish_reason
+                            delta = choice.get("delta") or {}
+                            text = delta.get("content")
+                            if isinstance(text, str) and text:
+                                content_parts.append(text)
+                                self.event_sink(AgentEvent(EventKind.TEXT_DELTA, text))
+                            reasoning = self._extract_reasoning_delta(delta)
+                            if reasoning:
+                                reasoning_parts.append(reasoning)
+                                self.event_sink(AgentEvent(EventKind.REASONING_DELTA, reasoning))
+                            self._merge_tool_call_deltas(tool_calls, delta.get("tool_calls") or [])
+            except ProviderRequestError:
+                raise
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                suffix = (
+                    " Stream output had already begun, so Gladiator will not replay the request automatically."
+                    if stream_started
+                    else ""
+                )
+                raise ProviderTransportError(
+                    f"Provider transport error: {type(exc).__name__}: {exc}.{suffix}",
+                    stream_started=stream_started,
+                ) from exc
+        finally:
+            if timer is not None:
+                timer.cancel()
 
+        return content_parts, reasoning_parts, tool_calls, finish_reason, usage
+
+    def _assemble_result(
+        self,
+        messages: list[dict],
+        content_parts: list[str],
+        reasoning_parts: list[str],
+        tool_calls: dict[int, dict[str, Any]],
+        finish_reason: str | None,
+        usage: dict[str, Any],
+    ) -> dict:
         content = "".join(content_parts).strip()
         reasoning = "".join(reasoning_parts)
         assembled_calls = [tool_calls[index] for index in sorted(tool_calls)]
@@ -208,9 +348,6 @@ class OpenAICompatibleStreamingModel:
 
         if not assembled_calls:
             if content:
-                # A compatible model is allowed to answer directly when no computer/tool work
-                # is needed. Preserve that assistant turn in history as well as the local exit
-                # marker so a later Telegram request sees a normal user/assistant conversation.
                 assistant_message = {
                     "role": "assistant",
                     "content": content,
@@ -242,7 +379,7 @@ class OpenAICompatibleStreamingModel:
             )
 
         actions = self._parse_actions(assembled_calls, finish_reason=finish_reason)
-        message: dict[str, Any] = {
+        return {
             "role": "assistant",
             "content": "".join(content_parts) or None,
             "tool_calls": assembled_calls,
@@ -255,7 +392,6 @@ class OpenAICompatibleStreamingModel:
                 "finish_reason": finish_reason,
             },
         }
-        return message
 
     @classmethod
     def _raise_provider_http_error(cls, response: Any) -> None:
@@ -279,11 +415,19 @@ class OpenAICompatibleStreamingModel:
         provider_family = str(
             headers.get("x-si-provider-family") or headers.get("x-si-served-by") or headers.get("x-provider") or ""
         )
+        retry_after_seconds: float | None = None
+        raw_retry_after = headers.get("retry-after")
+        if raw_retry_after is not None:
+            try:
+                retry_after_seconds = max(0.0, float(raw_retry_after))
+            except (TypeError, ValueError):
+                retry_after_seconds = None
         raise ProviderRequestError(
             status_code=status_code,
             detail=cls._provider_error_detail(body),
             request_id=request_id,
             provider_family=provider_family,
+            retry_after_seconds=retry_after_seconds,
         )
 
     @staticmethod
@@ -306,6 +450,37 @@ class OpenAICompatibleStreamingModel:
             text = re.sub(r"\s+", " ", text)
             return text[:1200]
         return "request rejected without an error body"
+
+    @staticmethod
+    def _is_retryable_provider_error(error: ProviderRequestError) -> bool:
+        if error.status_code in {408, 409, 425, 429} or 500 <= error.status_code <= 599:
+            return True
+        if error.status_code != 400:
+            return False
+        detail = error.detail.lower()
+        transient_markers = (
+            "previous_response_id",
+            "temporarily",
+            "try again",
+            "upstream",
+            "overloaded",
+            "model provider",
+        )
+        return any(marker in detail for marker in transient_markers)
+
+    def _retry_delay(self, attempt: int, retry_after_seconds: float | None) -> float:
+        if retry_after_seconds is not None:
+            return min(retry_after_seconds, 30.0)
+        return min(self.retry_base_seconds * (2**attempt), 8.0)
+
+    def _sleep_with_cancel(self, seconds: float) -> None:
+        deadline = time.monotonic() + seconds
+        while True:
+            self._raise_if_cancelled()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.1, remaining))
 
     def _raise_if_cancelled(self) -> None:
         if self.cancel_event is not None and self.cancel_event.is_set():
@@ -351,9 +526,6 @@ class OpenAICompatibleStreamingModel:
                 call["function"]["arguments"] += str(function["arguments"])
         for call in target.values():
             if not call["id"]:
-                # Some compatible streaming endpoints omit the tool-call id. Generate a
-                # portable OpenAI-shaped id that is unique across turns and short enough
-                # for strict providers instead of reusing a per-index constant.
                 call["id"] = f"call_{uuid.uuid4().hex[:24]}"
 
     def _parse_actions(self, tool_calls: list[dict[str, Any]], *, finish_reason: str | None) -> list[dict]:
@@ -385,7 +557,9 @@ class OpenAICompatibleStreamingModel:
             error=error,
             finish_reason=finish_reason,
         )
-        raise FormatError({"role": "user", "content": rendered, "extra": {"interrupt_type": "FormatError", "cost": 0.0}})
+        raise FormatError(
+            {"role": "user", "content": rendered, "extra": {"interrupt_type": "FormatError", "cost": 0.0}}
+        )
 
     def format_message(self, **kwargs) -> dict:
         return dict(kwargs)

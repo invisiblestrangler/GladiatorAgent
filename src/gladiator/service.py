@@ -290,6 +290,15 @@ class GladiatorService:
                 milestones.append("✓ Context compacted; continuing")
             elif event.kind == EventKind.WARNING:
                 milestones.append(f"⚠ {event.text[:220]}")
+            elif event.kind == EventKind.STATUS:
+                if event.data.get("replace_slow_stream"):
+                    milestones = deque(
+                        (item for item in milestones if not item.startswith("⏳ Still waiting for the model")),
+                        maxlen=5,
+                    )
+                item = event.text[:220]
+                if not milestones or milestones[-1] != item:
+                    milestones.append(item)
             elif event.kind == EventKind.ARTIFACT_READY:
                 path = Path(str(event.data["path"]))
                 await self._send_artifact(chat_id, path, bool(event.data.get("is_image")))
@@ -322,7 +331,7 @@ class GladiatorService:
         if first_activity_preview:
             summary.append(first_activity_preview)
         for item in milestones:
-            if item.startswith("▶ ") or item in summary:
+            if item.startswith("▶ ") or item.startswith("⏳ Still waiting for the model") or item in summary:
                 continue
             summary.append(item)
         if len(summary) <= 4:
