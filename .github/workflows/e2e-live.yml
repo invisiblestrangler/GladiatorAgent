@@ -2,6 +2,11 @@ name: Live E2E
 
 on:
   workflow_dispatch:
+  push:
+    branches: [feat/bootstrap-runtime]
+    paths:
+      - ".github/workflows/e2e-live.yml"
+      - "scripts/e2e_image_interactive.py"
 
 permissions:
   contents: read
@@ -10,13 +15,13 @@ jobs:
   live-e2e:
     runs-on: ubuntu-latest
     environment: env
-    timeout-minutes: 20
+    timeout-minutes: 15
     env:
       E2E_API_KEY: ${{ secrets.OPENROUTER_KEY }}
       GLADIATOR_TG_BOT: ${{ secrets.GLADIATOR_TG_BOT }}
       TG_USER_ID: ${{ secrets.TG_USER_ID }}
       E2E_BASE_URL: https://openrouter.ai/api/v1
-      E2E_MODEL: nvidia/nemotron-3-ultra-550b-a55b:free
+      E2E_MODEL: thinkingmachines/inkling:free
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -24,5 +29,7 @@ jobs:
           python-version: "3.11"
       - name: Install Gladiator
         run: uv sync --extra dev
-      - name: Run live Telegram + agent E2E
-        run: uv run python scripts/e2e_live.py
+      - name: Install image test dependency
+        run: uv pip install pillow
+      - name: Wait for Telegram image and run multimodal E2E
+        run: uv run python scripts/e2e_image_interactive.py
