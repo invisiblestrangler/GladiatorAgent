@@ -4,7 +4,7 @@ import json
 import re
 
 import pytest
-from minisweagent.exceptions import FormatError, Submitted
+from minisweagent.exceptions import Submitted
 
 from gladiator.cache_session import CacheStats
 from gladiator.models.openai_streaming import (
@@ -197,13 +197,15 @@ def test_text_only_response_after_tool_work_is_final_submission(monkeypatch):
     with pytest.raises(Submitted) as submitted:
         model.query(history)
 
-    message = submitted.value.messages[0]
-    assert message["role"] == "exit"
-    assert message["extra"]["exit_status"] == "Submitted"
-    assert message["extra"]["submission"] == "Finished cleanly."
+    assistant, terminal = submitted.value.messages
+    assert assistant["role"] == "assistant"
+    assert assistant["content"] == "Finished cleanly."
+    assert terminal["role"] == "exit"
+    assert terminal["extra"]["exit_status"] == "Submitted"
+    assert terminal["extra"]["submission"] == "Finished cleanly."
 
 
-def test_text_only_response_before_any_tool_work_remains_format_error(monkeypatch):
+def test_text_only_response_before_any_tool_work_is_direct_submission(monkeypatch):
     monkeypatch.setattr("gladiator.models.openai_streaming.httpx.Client", FakeTextClient)
     model = OpenAICompatibleStreamingModel(
         base_url="https://example.invalid/v1",
@@ -211,13 +213,22 @@ def test_text_only_response_before_any_tool_work_remains_format_error(monkeypatc
         model_name="test/model",
     )
 
-    with pytest.raises(FormatError):
+    with pytest.raises(Submitted) as submitted:
         model.query(
             [
                 {"role": "system", "content": "stable-prefix"},
-                {"role": "user", "content": "do the work"},
+                {"role": "user", "content": "hello"},
             ]
         )
+
+    assistant, terminal = submitted.value.messages
+    assert assistant == {
+        "role": "assistant",
+        "content": "Finished cleanly.",
+        "extra": assistant["extra"],
+    }
+    assert terminal["role"] == "exit"
+    assert terminal["extra"]["submission"] == "Finished cleanly."
 
 
 def test_missing_streamed_tool_id_gets_unique_portable_round_trip_id(monkeypatch):
@@ -242,7 +253,7 @@ def test_missing_streamed_tool_id_gets_unique_portable_round_trip_id(monkeypatch
 
     with pytest.raises(Submitted) as submitted:
         model.query(history)
-    assert submitted.value.messages[0]["extra"]["submission"] == "Finished cleanly."
+    assert submitted.value.messages[-1]["extra"]["submission"] == "Finished cleanly."
 
 
 def test_invalid_local_tool_transcript_is_stopped_before_provider_call():
