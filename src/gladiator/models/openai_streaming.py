@@ -3,7 +3,9 @@ from __future__ import annotations
 import base64
 import json
 import mimetypes
+import re
 import time
+import uuid
 from pathlib import Path
 from threading import Event
 from typing import Any
@@ -14,6 +16,36 @@ from jinja2 import StrictUndefined, Template
 from gladiator.events import AgentEvent, EventKind, EventSink, null_event_sink
 from minisweagent.exceptions import FormatError, Submitted, UserInterruption
 from minisweagent.models.utils.actions_toolcall import BASH_TOOL, format_toolcall_observation_messages
+
+
+class ProviderRequestError(RuntimeError):
+    """Sanitized provider HTTP failure suitable for Telegram and logs."""
+
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        detail: str,
+        request_id: str = "",
+        provider_family: str = "",
+    ) -> None:
+        self.status_code = status_code
+        self.detail = detail
+        self.request_id = request_id
+        self.provider_family = provider_family
+        parts = [f"Provider HTTP {status_code}: {detail}"]
+        metadata: list[str] = []
+        if provider_family:
+            metadata.append(f"provider={provider_family}")
+        if request_id:
+            metadata.append(f"request_id={request_id}")
+        if metadata:
+            parts.append("(" + ", ".join(metadata) + ")")
+        super().__init__(" ".join(parts))
+
+
+class ToolTranscriptError(RuntimeError):
+    """Raised before a request when local tool-call history violates the OpenAI transcript contract."""
 
 
 class OpenAICompatibleStreamingModel:
@@ -58,6 +90,7 @@ class OpenAICompatibleStreamingModel:
             clean = {k: v for k, v in message.items() if k != "extra"}
             clean["content"] = self._expand_local_images(clean.get("content"))
             prepared.append(clean)
+        self._validate_tool_transcript(prepared)
         return prepared
 
     def _expand_local_images(self, content: Any) -> Any:
@@ -74,6 +107,45 @@ class OpenAICompatibleStreamingModel:
             encoded = base64.b64encode(raw).decode("ascii")
             expanded.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}})
         return expanded
+
+    @staticmethod
+    def _validate_tool_transcript(messages: list[dict]) -> None:
+        pending: list[str] = []
+        for index, message in enumerate(messages):
+            role = str(message.get("role") or "")
+            if pending:
+                if role != "tool":
+                    raise ToolTranscriptError(
+                        f"Invalid local tool transcript before message {index}: expected tool result(s) for "
+                        f"{', '.join(pending)}, got role={role!r}. Start /new if this session came from an older broken run."
+                    )
+                tool_call_id = str(message.get("tool_call_id") or "")
+                if tool_call_id not in pending:
+                    raise ToolTranscriptError(
+                        f"Invalid local tool transcript at message {index}: unexpected tool_call_id={tool_call_id!r}; "
+                        f"expected one of {pending}."
+                    )
+                pending.remove(tool_call_id)
+                continue
+
+            if role == "tool":
+                raise ToolTranscriptError(
+                    f"Invalid local tool transcript at message {index}: orphan tool result "
+                    f"{message.get('tool_call_id')!r}. Start /new if this session came from an older broken run."
+                )
+            tool_calls = message.get("tool_calls")
+            if role == "assistant" and isinstance(tool_calls, list) and tool_calls:
+                ids = [str(call.get("id") or "") for call in tool_calls if isinstance(call, dict)]
+                if len(ids) != len(tool_calls) or any(not call_id for call_id in ids):
+                    raise ToolTranscriptError(f"Invalid local tool transcript at message {index}: missing tool call id.")
+                if len(set(ids)) != len(ids):
+                    raise ToolTranscriptError(f"Invalid local tool transcript at message {index}: duplicate tool call ids.")
+                pending = ids
+
+        if pending:
+            raise ToolTranscriptError(
+                "Invalid local tool transcript at end of history: missing tool result(s) for " + ", ".join(pending)
+            )
 
     def query(self, messages: list[dict], **_kwargs) -> dict:
         self._raise_if_cancelled()
@@ -97,7 +169,7 @@ class OpenAICompatibleStreamingModel:
         timeout = httpx.Timeout(self.timeout_seconds, connect=min(30.0, self.timeout_seconds))
         with httpx.Client(timeout=timeout) as client:
             with client.stream("POST", f"{self.base_url}/chat/completions", headers=headers, json=payload) as response:
-                response.raise_for_status()
+                self._raise_provider_http_error(response)
                 for line in response.iter_lines():
                     self._raise_if_cancelled()
                     if not line or not line.startswith("data:"):
@@ -173,6 +245,56 @@ class OpenAICompatibleStreamingModel:
         }
         return message
 
+    @classmethod
+    def _raise_provider_http_error(cls, response: Any) -> None:
+        status_code = int(getattr(response, "status_code", 200) or 200)
+        if status_code < 400:
+            return
+        body = ""
+        try:
+            raw = response.read()
+            if isinstance(raw, bytes):
+                body = raw.decode("utf-8", errors="replace")
+            else:
+                body = str(raw)
+        except Exception:
+            try:
+                body = str(response.text)
+            except Exception:
+                body = ""
+        headers = getattr(response, "headers", {}) or {}
+        request_id = str(headers.get("x-request-id") or headers.get("request-id") or "")
+        provider_family = str(
+            headers.get("x-si-provider-family") or headers.get("x-si-served-by") or headers.get("x-provider") or ""
+        )
+        raise ProviderRequestError(
+            status_code=status_code,
+            detail=cls._provider_error_detail(body),
+            request_id=request_id,
+            provider_family=provider_family,
+        )
+
+    @staticmethod
+    def _provider_error_detail(body: str) -> str:
+        text = body.strip()
+        if text:
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                candidates: list[Any] = [parsed.get("message"), parsed.get("detail"), parsed.get("error")]
+                error = parsed.get("error")
+                if isinstance(error, dict):
+                    candidates = [error.get("message"), error.get("detail"), error.get("code"), *candidates]
+                for value in candidates:
+                    if isinstance(value, str) and value.strip():
+                        text = value.strip()
+                        break
+            text = re.sub(r"\s+", " ", text)
+            return text[:1200]
+        return "request rejected without an error body"
+
     def _raise_if_cancelled(self) -> None:
         if self.cancel_event is not None and self.cancel_event.is_set():
             raise UserInterruption(
@@ -210,15 +332,27 @@ class OpenAICompatibleStreamingModel:
                 {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
             )
             if raw.get("id"):
-                call["id"] = raw["id"]
+                call["id"] = str(raw["id"])
             function = raw.get("function") or {}
-            if function.get("name"):
-                call["function"]["name"] += str(function["name"])
+            incoming_name = str(function.get("name") or "")
+            if incoming_name:
+                current_name = str(call["function"].get("name") or "")
+                if not current_name:
+                    call["function"]["name"] = incoming_name
+                elif incoming_name == current_name:
+                    pass
+                elif incoming_name.startswith(current_name):
+                    call["function"]["name"] = incoming_name
+                elif not current_name.endswith(incoming_name):
+                    call["function"]["name"] += incoming_name
             if function.get("arguments"):
                 call["function"]["arguments"] += str(function["arguments"])
-        for index, call in target.items():
+        for call in target.values():
             if not call["id"]:
-                call["id"] = f"gladiator_call_{index}"
+                # Some compatible streaming endpoints omit the tool-call id. Generate a
+                # portable OpenAI-shaped id that is unique across turns and short enough
+                # for strict providers instead of reusing a per-index constant.
+                call["id"] = f"call_{uuid.uuid4().hex[:24]}"
 
     def _parse_actions(self, tool_calls: list[dict[str, Any]], *, finish_reason: str | None) -> list[dict]:
         if not tool_calls:

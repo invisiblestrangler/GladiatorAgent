@@ -61,6 +61,17 @@ def test_command_summary_keeps_relevant_file_names():
     )
 
 
+def test_compound_svg_creation_is_summarized_without_embedded_url():
+    command = (
+        "mkdir -p /root/cute-dog-project && cat > /root/cute-dog-project/cute-dog.svg <<'SVG' "
+        "<svg xmlns='http://www.w3.org/2000/svg'><circle cx='20' cy='20' r='10'/></svg> SVG"
+    )
+    summary = summarize_shell_command(command)
+    assert summary == "Writing cute-dog-project/cute-dog.svg"
+    assert "http" not in summary
+    assert "w3.org" not in summary
+
+
 def test_command_summary_truncates_unknown_commands():
     summary = summarize_shell_command("custom-tool " + "x" * 300, max_chars=80)
     assert len(summary) <= 80
@@ -115,3 +126,23 @@ async def test_set_my_commands_uses_telegram_command_payload(monkeypatch):
             ]
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_telegram_messages_disable_link_previews_by_default(monkeypatch):
+    client = TelegramClient("test-token")
+    calls = []
+
+    async def fake_call(method, payload=None):
+        calls.append((method, payload))
+        return {"message_id": 1}
+
+    monkeypatch.setattr(client, "_call", fake_call)
+    try:
+        await client.send_message(123, "https://www.w3.org/2000/svg")
+        await client.edit_message_text(123, 1, "https://example.com")
+    finally:
+        await client.close()
+
+    assert calls[0][1]["link_preview_options"] == {"is_disabled": True}
+    assert calls[1][1]["link_preview_options"] == {"is_disabled": True}

@@ -54,12 +54,15 @@ class TelegramClient:
         *,
         parse_mode: str | None = "HTML",
         reply_markup: dict[str, Any] | None = None,
+        disable_link_preview: bool = True,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
         if parse_mode:
             payload["parse_mode"] = parse_mode
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
+        if disable_link_preview:
+            payload["link_preview_options"] = {"is_disabled": True}
         return await self._call("sendMessage", payload)
 
     async def edit_message_text(
@@ -70,12 +73,15 @@ class TelegramClient:
         *,
         parse_mode: str | None = "HTML",
         reply_markup: dict[str, Any] | None = None,
+        disable_link_preview: bool = True,
     ) -> dict[str, Any] | bool:
         payload: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "text": text}
         if parse_mode:
             payload["parse_mode"] = parse_mode
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
+        if disable_link_preview:
+            payload["link_preview_options"] = {"is_disabled": True}
         return await self._call("editMessageText", payload)
 
     async def edit_message_reply_markup(

@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 from minisweagent.exceptions import FormatError, Submitted
 
 from gladiator.cache_session import CacheStats
-from gladiator.models.openai_streaming import OpenAICompatibleStreamingModel
+from gladiator.models.openai_streaming import (
+    OpenAICompatibleStreamingModel,
+    ProviderRequestError,
+    ToolTranscriptError,
+)
 from gladiator.runtime.session import load_or_create_session, rotate_session
 
 
 class FakeResponse:
     headers = {}
+    status_code = 200
 
     def __enter__(self):
         return self
@@ -19,8 +25,8 @@ class FakeResponse:
     def __exit__(self, *_args):
         return False
 
-    def raise_for_status(self):
-        return None
+    def read(self):
+        return b""
 
     def iter_lines(self):
         chunk = {
@@ -81,6 +87,66 @@ class FakeTextClient(FakeClient):
     def stream(self, method, url, **kwargs):
         type(self).last_request = (method, url, kwargs)
         return FakeTextResponse()
+
+
+class MissingIdToolResponse(FakeResponse):
+    def iter_lines(self):
+        chunk = {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": json.dumps({"command": "printf ok"}),
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+        yield "data: " + json.dumps(chunk)
+        yield "data: [DONE]"
+
+
+class StrictRoundTripClient(FakeClient):
+    calls = 0
+
+    def stream(self, method, url, **kwargs):
+        type(self).calls += 1
+        if type(self).calls == 1:
+            return MissingIdToolResponse()
+
+        messages = kwargs["json"]["messages"]
+        assistant = next(message for message in reversed(messages) if message.get("role") == "assistant")
+        tool = next(message for message in reversed(messages) if message.get("role") == "tool")
+        call_id = assistant["tool_calls"][0]["id"]
+        # Simulates a strict OpenAI-compatible router: portable id, exact tool-result match,
+        # and no reused per-index placeholder such as the old gladiator_call_0.
+        assert re.fullmatch(r"call_[0-9a-f]{24}", call_id)
+        assert len(call_id) <= 40
+        assert tool["tool_call_id"] == call_id
+        return FakeTextResponse()
+
+
+class ErrorResponse(FakeResponse):
+    status_code = 400
+    headers = {"x-request-id": "req_strict_123", "x-si-provider-family": "strict-seller"}
+
+    def read(self):
+        return b'{"error":{"message":"tool_call_id did not match the preceding assistant tool call","code":"invalid_request"}}'
+
+    def iter_lines(self):
+        raise AssertionError("400 response must not be parsed as SSE")
+
+
+class ErrorClient(FakeClient):
+    def stream(self, method, url, **kwargs):
+        return ErrorResponse()
 
 
 def test_provider_request_has_no_vendor_specific_cache_controls(monkeypatch):
@@ -152,6 +218,74 @@ def test_text_only_response_before_any_tool_work_remains_format_error(monkeypatc
                 {"role": "user", "content": "do the work"},
             ]
         )
+
+
+def test_missing_streamed_tool_id_gets_unique_portable_round_trip_id(monkeypatch):
+    StrictRoundTripClient.calls = 0
+    monkeypatch.setattr("gladiator.models.openai_streaming.httpx.Client", StrictRoundTripClient)
+    model = OpenAICompatibleStreamingModel(
+        base_url="https://strict.example/v1",
+        api_key="test-key",
+        model_name="test/model",
+    )
+    history = [
+        {"role": "system", "content": "stable-prefix"},
+        {"role": "user", "content": "use the tool then finish"},
+    ]
+
+    assistant = model.query(history)
+    observations = model.format_observation_messages(
+        assistant,
+        [{"output": "ok", "returncode": 0, "exception_info": ""}],
+    )
+    history.extend([assistant, *observations])
+
+    with pytest.raises(Submitted) as submitted:
+        model.query(history)
+    assert submitted.value.messages[0]["extra"]["submission"] == "Finished cleanly."
+
+
+def test_invalid_local_tool_transcript_is_stopped_before_provider_call():
+    model = OpenAICompatibleStreamingModel(
+        base_url="https://strict.example/v1",
+        api_key="test-key",
+        model_name="test/model",
+    )
+    broken = [
+        {"role": "system", "content": "stable-prefix"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call_missing", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+            ],
+        },
+        {"role": "user", "content": "this illegally interrupts the tool result"},
+    ]
+    with pytest.raises(ToolTranscriptError, match="expected tool result"):
+        model._prepare_messages_for_api(broken)
+
+
+def test_provider_400_surfaces_sanitized_body_and_request_metadata(monkeypatch):
+    monkeypatch.setattr("gladiator.models.openai_streaming.httpx.Client", ErrorClient)
+    model = OpenAICompatibleStreamingModel(
+        base_url="https://strict.example/v1",
+        api_key="test-key",
+        model_name="test/model",
+    )
+    with pytest.raises(ProviderRequestError) as error:
+        model.query(
+            [
+                {"role": "system", "content": "stable-prefix"},
+                {"role": "user", "content": "do the work"},
+            ]
+        )
+    rendered = str(error.value)
+    assert "Provider HTTP 400" in rendered
+    assert "tool_call_id did not match" in rendered
+    assert "provider=strict-seller" in rendered
+    assert "request_id=req_strict_123" in rendered
+    assert "developer.mozilla.org" not in rendered
 
 
 def test_api_visible_prefix_is_stable_when_history_is_appended():
