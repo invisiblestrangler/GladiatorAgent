@@ -3,7 +3,6 @@ from __future__ import annotations
 import html
 import json
 import shutil
-from pathlib import Path
 
 from gladiator.cache_session import CacheStats
 from gladiator.events import AgentEvent, EventKind
