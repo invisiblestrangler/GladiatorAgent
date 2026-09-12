@@ -2,15 +2,6 @@ name: Live E2E
 
 on:
   workflow_dispatch:
-  # Temporary branch trigger so the bootstrap PR can prove the live path once.
-  # Remove this trigger after the first successful E2E; workflow_dispatch remains.
-  push:
-    branches: [feat/bootstrap-runtime]
-    paths:
-      - ".github/workflows/e2e-live.yml"
-      - "scripts/e2e_live.py"
-      - "src/**"
-      - "pyproject.toml"
 
 permissions:
   contents: read
