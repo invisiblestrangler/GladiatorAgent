@@ -11,7 +11,7 @@ The goal is Hermes-like usability on the go while preserving mini-swe-agent's sm
 - **Filesystem is external memory.** Large outputs and files stay on disk; the model gets bounded relevant excerpts and paths.
 - **No automatic skills.** Skills are only created or modified after an explicit user request.
 - **300k compaction target.** The effective threshold is the smaller of 300k tokens or roughly 82% of the selected model's known context window.
-- **Cache-friendly history.** API-visible history is append-only within a session and excludes UI/reasoning metadata. OpenRouter sessions use a stable routing/session key and response caching for identical retries.
+- **Cache-friendly history.** API-visible history is append-only within a session, keeps the system/tool prefix stable, and excludes UI/reasoning metadata. Gladiator does not inject provider-specific cache or routing controls.
 
 ## Setup
 
@@ -36,24 +36,42 @@ No manual config-file editing is required.
 
 ## Telegram controls
 
-- `/status` — provider/model/reasoning, approximate context size, session, and provider-reported prompt-cache metrics
+- `/status` — provider/model/reasoning, approximate context size, local session, TODO count, and provider-reported prompt-cache metrics when available
 - `/model [id]` — show or change model
 - `/reasoning [off|minimal|low|medium|high|xhigh]`
 - `/trace [off|milestones|verbose]`
 - `/provider [endpoint] [api-key]` — show/change OpenAI-compatible provider
 - `/compact` — compact at the next safe agent boundary
 - `/new` — archive the current conversational state and start a clean session while keeping workspace files, skills, and settings
+- `/todo` — show the current external task ledger
 - `/stop` — stop the current run
 
 ## Sessions and caching
 
-Gladiator keeps one persistent session ID per conversation session. On OpenRouter that ID is sent both as `session_id` and `x-session-id`, improving sticky routing to the provider that already has the prompt prefix cached. The system prompt, tool schema, and previous messages stay byte-stable as the conversation grows; Telegram/UI events and `message.extra` metadata are not sent to the model.
+Gladiator keeps the system prompt, tool schema, and previous API-visible messages byte-stable as a session grows. New information is appended at the tail instead of rewriting prior messages. Telegram/UI events, timestamps, reasoning traces, and `message.extra` metadata are not sent back to the model.
 
-The current trajectory and session ID are persisted under the workspace's `.gladiator/` directory. Restarting Gladiator restores that trajectory, so a process restart does not automatically throw away conversational state or the stable cache-routing key.
+This is intentionally provider-agnostic: Gladiator does not send sticky-routing IDs, cache headers, provider-selection hints, or other vendor-specific cache controls. If a compatible backend implements prefix caching, it can reuse the stable prompt prefix naturally.
 
-`/new` intentionally rotates the session ID and clears conversation history. The previous trajectory and compact handoff are archived under `.gladiator/sessions/`; workspace files, global skills, and configuration are left alone.
+The current trajectory and local session ID are persisted under the workspace's `.gladiator/` directory. Restarting Gladiator restores that trajectory. `/new` rotates the local session ID and clears conversation/TODO state; the previous trajectory, compact handoff, and TODO ledger are archived under `.gladiator/sessions/`. Workspace files, global skills, and configuration are left alone.
 
-At the compaction boundary Gladiator writes `.gladiator/contextAfterCompact.md`, validates it, and replaces the old message history with a small stable resume context. The first request after compaction is naturally a new prompt prefix; subsequent turns can cache that new prefix normally.
+At the compaction boundary Gladiator writes `.gladiator/contextAfterCompact.md`, validates it, and replaces the old message history with a small stable resume context. The first request after compaction is naturally a new prompt prefix; subsequent turns can cache that prefix normally.
+
+If the provider reports cache-token usage using OpenAI-compatible usage fields, `/status` surfaces it. Missing cache telemetry is treated as "not reported", not as a cache miss.
+
+## Task ledger
+
+For multi-step work, Gladiator can maintain a tiny external TODO ledger at `.gladiator/todo.json`. It stays outside normal model context and is read only when needed.
+
+Agent-facing commands:
+
+```bash
+gladiator todo show
+gladiator todo add "inspect failing auth test"
+gladiator todo done 1
+gladiator todo clear
+```
+
+The agent is instructed to use this for multi-step work, keep it concise, and avoid creating TODOs for trivial one-step tasks. `/todo` lets the Telegram user inspect the current ledger without adding it to model context. The ledger survives process restarts and compaction, and `/new` archives then clears it.
 
 ## Web and files
 
@@ -70,4 +88,4 @@ Skills are lazy external memory. The agent sees names first and reads one releva
 
 ## Development status
 
-The bootstrap runtime includes Telegram streaming and typing feedback, OpenAI-compatible streaming, image/file transfer, provider/model/reasoning controls, context compaction, persistent sessions, OpenRouter cache telemetry, lazy explicit skills, SearXNG/web extraction, optional Browser Use installation, YOLO execution, and conservative one-hour escalation fallback.
+The bootstrap runtime includes Telegram streaming and typing feedback, provider-agnostic OpenAI-compatible streaming, image/file transfer, provider/model/reasoning controls, context compaction, persistent sessions, provider-reported cache telemetry when available, the external TODO ledger, lazy explicit skills, SearXNG/web extraction, optional Browser Use installation, YOLO execution, and conservative one-hour escalation fallback.
