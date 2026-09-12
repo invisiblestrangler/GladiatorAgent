@@ -29,17 +29,64 @@ class TelegramClient:
         return body.get("result")
 
     async def get_updates(self, *, offset: int | None = None, timeout: int = 30) -> list[dict[str, Any]]:
-        payload: dict[str, Any] = {"timeout": timeout, "allowed_updates": ["message", "stopped_message_generation"]}
+        payload: dict[str, Any] = {
+            "timeout": timeout,
+            "allowed_updates": ["message", "callback_query", "stopped_message_generation"],
+        }
         if offset is not None:
             payload["offset"] = offset
         result = await self._call("getUpdates", payload)
         return result if isinstance(result, list) else []
 
-    async def send_message(self, chat_id: int, text: str, *, parse_mode: str | None = "HTML") -> dict[str, Any]:
+    async def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        parse_mode: str | None = "HTML",
+        reply_markup: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
         if parse_mode:
             payload["parse_mode"] = parse_mode
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         return await self._call("sendMessage", payload)
+
+    async def edit_message_text(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        *,
+        parse_mode: str | None = "HTML",
+        reply_markup: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | bool:
+        payload: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "text": text}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        return await self._call("editMessageText", payload)
+
+    async def edit_message_reply_markup(
+        self,
+        chat_id: int,
+        message_id: int,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | bool:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reply_markup": reply_markup or {"inline_keyboard": []},
+        }
+        return await self._call("editMessageReplyMarkup", payload)
+
+    async def answer_callback_query(self, callback_query_id: str, text: str | None = None) -> bool:
+        payload: dict[str, Any] = {"callback_query_id": callback_query_id}
+        if text:
+            payload["text"] = text
+        return bool(await self._call("answerCallbackQuery", payload))
 
     async def send_message_draft(
         self,
