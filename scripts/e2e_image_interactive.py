@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import os
 import tempfile
 import time
 from pathlib import Path
 
+import httpx
 from PIL import Image
+from minisweagent.models.utils.actions_toolcall import BASH_TOOL
 
 from gladiator.config import (
     GladiatorConfig,
@@ -30,6 +34,74 @@ def required_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"Required E2E environment variable is missing: {name}")
     return value
+
+
+def _synthetic_image_data_url() -> str:
+    image = Image.new("RGB", (64, 48), (32, 96, 160))
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def _preflight_request(
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    include_image: bool,
+    app_attribution: bool,
+) -> tuple[int, str]:
+    content: str | list[dict]
+    if include_image:
+        content = [
+            {"type": "text", "text": "Synthetic multimodal harness preflight. Inspect the attached color block and call the bash tool."},
+            {"type": "image_url", "image_url": {"url": _synthetic_image_data_url()}},
+        ]
+    else:
+        content = "Agentic harness preflight. Call the bash tool with command: printf preflight-ok\\n"
+
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": content}],
+        "tools": [BASH_TOOL],
+        "tool_choice": "auto",
+        "stream": False,
+        "reasoning_effort": "low",
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    if app_attribution:
+        headers["HTTP-Referer"] = "https://github.com/invisiblestrangler/GladiatorAgent"
+        headers["X-Title"] = "GladiatorAgent"
+
+    with httpx.Client(timeout=httpx.Timeout(90.0, connect=20.0)) as client:
+        response = client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
+    return response.status_code, response.text[:3000]
+
+
+async def run_provider_preflight(*, api_key: str, base_url: str, model: str) -> None:
+    probes = [
+        ("text_tools_plain", False, False),
+        ("text_tools_attributed", False, True),
+        ("image_tools_attributed", True, True),
+    ]
+    failures: list[str] = []
+    for name, include_image, app_attribution in probes:
+        status, body = await asyncio.to_thread(
+            _preflight_request,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            include_image=include_image,
+            app_attribution=app_attribution,
+        )
+        print(f"INKLING_PREFLIGHT {name} status={status} body={body}")
+        if status >= 400:
+            failures.append(f"{name}: HTTP {status}: {body[:1200]}")
+
+    # The attributed multimodal probe is the capability we actually need for this E2E.
+    if any(item.startswith("image_tools_attributed:") for item in failures):
+        raise RuntimeError("Inkling multimodal preflight failed: " + " | ".join(failures))
 
 
 async def drain_pending_updates(service: ExtendedGladiatorService) -> int | None:
@@ -80,15 +152,21 @@ async def main() -> None:
     api_key = required_env("E2E_API_KEY")
     bot_token = required_env("GLADIATOR_TG_BOT")
     user_id = int(required_env("TG_USER_ID"))
+    base_url = os.environ.get("E2E_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+    model = os.environ.get("E2E_MODEL", DEFAULT_MODEL)
+
+    # Fail before asking the user for another image if this account/model route rejects
+    # agentic or multimodal requests. The synthetic image contains no user data.
+    await run_provider_preflight(api_key=api_key, base_url=base_url, model=model)
 
     workspace = Path(tempfile.mkdtemp(prefix="gladiator-image-e2e-"))
     config_path = workspace / ".gladiator" / "e2e-image-config.json"
     config = GladiatorConfig(
         provider=ProviderConfig(
             name="image-e2e",
-            base_url=os.environ.get("E2E_BASE_URL", DEFAULT_BASE_URL).rstrip("/"),
+            base_url=base_url,
             api_key=api_key,
-            model=os.environ.get("E2E_MODEL", DEFAULT_MODEL),
+            model=model,
             reasoning_effort="low",
             context_window=1_048_576,
         ),
