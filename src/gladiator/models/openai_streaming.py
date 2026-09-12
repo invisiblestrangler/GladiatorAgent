@@ -10,18 +10,14 @@ from typing import Any
 
 import httpx
 from jinja2 import StrictUndefined, Template
-
-from gladiator.events import AgentEvent, EventKind, EventSink, null_event_sink
 from minisweagent.exceptions import FormatError, UserInterruption
 from minisweagent.models.utils.actions_toolcall import BASH_TOOL, format_toolcall_observation_messages
 
+from gladiator.events import AgentEvent, EventKind, EventSink, null_event_sink
+
 
 class OpenAICompatibleStreamingModel:
-    """Small OpenAI-compatible chat-completions model with first-class streaming hooks.
-
-    Streaming deltas are emitted to the UI event sink but only the final assembled
-    assistant message is returned to mini-swe-agent and therefore enters context.
-    """
+    """Small OpenAI-compatible chat-completions model with first-class streaming hooks."""
 
     def __init__(
         self,
@@ -30,6 +26,7 @@ class OpenAICompatibleStreamingModel:
         api_key: str,
         model_name: str,
         reasoning_effort: str = "high",
+        session_id: str | None = None,
         event_sink: EventSink = null_event_sink,
         timeout_seconds: float = 300.0,
         cancel_event: Event | None = None,
@@ -40,6 +37,7 @@ class OpenAICompatibleStreamingModel:
         self.api_key = api_key
         self.model_name = model_name
         self.reasoning_effort = reasoning_effort
+        self.session_id = session_id
         self.event_sink = event_sink
         self.timeout_seconds = timeout_seconds
         self.cancel_event = cancel_event
@@ -49,6 +47,25 @@ class OpenAICompatibleStreamingModel:
         )
         self.format_error_template = format_error_template or "Format error: {{ error }}"
         self.last_usage: dict[str, Any] = {}
+        self.last_response_cache_status: str | None = None
+        self.total_prompt_tokens = 0
+        self.total_cached_tokens = 0
+        self.total_cache_write_tokens = 0
+
+    @property
+    def is_openrouter(self) -> bool:
+        return "openrouter.ai" in self.base_url.lower()
+
+    @property
+    def last_prompt_cache_ratio(self) -> float | None:
+        prompt = int(self.last_usage.get("prompt_tokens") or 0)
+        details = self.last_usage.get("prompt_tokens_details") or {}
+        cached = int(details.get("cached_tokens") or 0) if isinstance(details, dict) else 0
+        return (cached / prompt) if prompt > 0 else None
+
+    @property
+    def cumulative_prompt_cache_ratio(self) -> float | None:
+        return (self.total_cached_tokens / self.total_prompt_tokens) if self.total_prompt_tokens > 0 else None
 
     def _prepare_messages_for_api(self, messages: list[dict]) -> list[dict]:
         prepared: list[dict] = []
@@ -86,6 +103,10 @@ class OpenAICompatibleStreamingModel:
         }
         if self.reasoning_effort != "off":
             payload["reasoning_effort"] = self.reasoning_effort
+        if self.is_openrouter:
+            if self.session_id:
+                payload["session_id"] = self.session_id[:256]
+            payload["stream_options"] = {"include_usage": True}
 
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -94,40 +115,49 @@ class OpenAICompatibleStreamingModel:
         usage: dict[str, Any] = {}
 
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        if self.is_openrouter:
+            headers["X-OpenRouter-Cache"] = "true"
+            headers["X-OpenRouter-Cache-TTL"] = "300"
+            if self.session_id:
+                headers["x-session-id"] = self.session_id[:256]
         timeout = httpx.Timeout(self.timeout_seconds, connect=min(30.0, self.timeout_seconds))
-        with httpx.Client(timeout=timeout) as client:
-            with client.stream("POST", f"{self.base_url}/chat/completions", headers=headers, json=payload) as response:
-                response.raise_for_status()
-                for line in response.iter_lines():
-                    self._raise_if_cancelled()
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data)
-                    except json.JSONDecodeError:
-                        self.event_sink(AgentEvent(EventKind.WARNING, "Provider emitted an invalid SSE JSON chunk."))
-                        continue
-                    if isinstance(chunk.get("usage"), dict):
-                        usage = chunk["usage"]
-                    choices = chunk.get("choices") or []
-                    if not choices:
-                        continue
-                    choice = choices[0]
-                    finish_reason = choice.get("finish_reason") or finish_reason
-                    delta = choice.get("delta") or {}
-                    text = delta.get("content")
-                    if isinstance(text, str) and text:
-                        content_parts.append(text)
-                        self.event_sink(AgentEvent(EventKind.TEXT_DELTA, text))
-                    reasoning = self._extract_reasoning_delta(delta)
-                    if reasoning:
-                        reasoning_parts.append(reasoning)
-                        self.event_sink(AgentEvent(EventKind.REASONING_DELTA, reasoning))
-                    self._merge_tool_call_deltas(tool_calls, delta.get("tool_calls") or [])
+        with httpx.Client(timeout=timeout) as client, client.stream(
+            "POST", f"{self.base_url}/chat/completions", headers=headers, json=payload
+        ) as response:
+            response.raise_for_status()
+            self.last_response_cache_status = response.headers.get("X-OpenRouter-Cache-Status")
+            for line in response.iter_lines():
+                self._raise_if_cancelled()
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    self.event_sink(AgentEvent(EventKind.WARNING, "Provider emitted an invalid SSE JSON chunk."))
+                    continue
+                if isinstance(chunk.get("usage"), dict):
+                    usage = chunk["usage"]
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                finish_reason = choice.get("finish_reason") or finish_reason
+                delta = choice.get("delta") or {}
+                text = delta.get("content")
+                if isinstance(text, str) and text:
+                    content_parts.append(text)
+                    self.event_sink(AgentEvent(EventKind.TEXT_DELTA, text))
+                reasoning = self._extract_reasoning_delta(delta)
+                if reasoning:
+                    reasoning_parts.append(reasoning)
+                    self.event_sink(AgentEvent(EventKind.REASONING_DELTA, reasoning))
+                self._merge_tool_call_deltas(tool_calls, delta.get("tool_calls") or [])
 
+        self.last_usage = usage
+        self._record_usage(usage)
         assembled_calls = [tool_calls[index] for index in sorted(tool_calls)]
         actions = self._parse_actions(assembled_calls, finish_reason=finish_reason)
         message: dict[str, Any] = {
@@ -143,9 +173,24 @@ class OpenAICompatibleStreamingModel:
                 "finish_reason": finish_reason,
             },
         }
-        self.last_usage = usage
         self.event_sink(AgentEvent(EventKind.RESPONSE_FINISHED, data={"usage": usage, "finish_reason": finish_reason}))
         return message
+
+    def _record_usage(self, usage: dict[str, Any]) -> None:
+        prompt_tokens = int(usage.get("prompt_tokens") or 0)
+        details = usage.get("prompt_tokens_details") or {}
+        cached_tokens = int(details.get("cached_tokens") or 0) if isinstance(details, dict) else 0
+        write_tokens = int(details.get("cache_write_tokens") or 0) if isinstance(details, dict) else 0
+        self.total_prompt_tokens += prompt_tokens
+        self.total_cached_tokens += cached_tokens
+        self.total_cache_write_tokens += write_tokens
+
+    def reset_cache_metrics(self) -> None:
+        self.last_usage = {}
+        self.last_response_cache_status = None
+        self.total_prompt_tokens = 0
+        self.total_cached_tokens = 0
+        self.total_cache_write_tokens = 0
 
     def _raise_if_cancelled(self) -> None:
         if self.cancel_event is not None and self.cancel_event.is_set():
@@ -247,6 +292,7 @@ class OpenAICompatibleStreamingModel:
                         "model_name": self.model_name,
                         "base_url": self.base_url,
                         "reasoning_effort": self.reasoning_effort,
+                        "session_id": self.session_id,
                     },
                 }
             }
