@@ -9,17 +9,41 @@ from rich.console import Console
 from gladiator import __version__
 from gladiator.config import config_path, load_config
 from gladiator.service_ext import ExtendedGladiatorService
+from gladiator.setup.service import BackgroundServiceManager
 from gladiator.setup.wizard import run_setup
 from gladiator.todo import TodoManager
 
 app = typer.Typer(no_args_is_help=True, help="GladiatorAgent - Telegram-first mini-swe-agent runtime")
 todo_app = typer.Typer(no_args_is_help=True, help="Manage the current workspace task ledger")
+service_app = typer.Typer(no_args_is_help=True, help="Manage the persistent background Gladiator service")
 app.add_typer(todo_app, name="todo")
+app.add_typer(service_app, name="service")
 console = Console()
 
 
 def _workspace_todo() -> TodoManager:
     return TodoManager(Path.cwd() / ".gladiator" / "todo.json")
+
+
+def _service_manager(workspace: Path) -> BackgroundServiceManager:
+    return BackgroundServiceManager(workspace)
+
+
+def _require_config() -> None:
+    if config_path().exists():
+        return
+    console.print("[red]Gladiator is not configured.[/red] Run: gladiator setup")
+    raise typer.Exit(code=1)
+
+
+def _service_action(action) -> None:
+    try:
+        message = action()
+    except Exception as exc:
+        console.print(f"[red]Service operation failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    if message:
+        console.print(message)
 
 
 @app.command()
@@ -52,6 +76,54 @@ def run(workspace: Path = typer.Option(Path.cwd(), "--workspace", "-w")) -> None
         asyncio.run(service.run_forever())
     except KeyboardInterrupt:
         console.print("Stopped Gladiator.")
+
+
+@service_app.command("install")
+def service_install(workspace: Path = typer.Option(Path.cwd(), "--workspace", "-w")) -> None:
+    """Install and start Gladiator as a supervised background service."""
+    _require_config()
+    manager = _service_manager(workspace)
+    _service_action(manager.install)
+
+
+@service_app.command("status")
+def service_status(workspace: Path = typer.Option(Path.cwd(), "--workspace", "-w")) -> None:
+    """Show background-service status."""
+    manager = _service_manager(workspace)
+    try:
+        state = manager.status()
+    except Exception as exc:
+        console.print(f"[red]Service operation failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"Installed: {'yes' if state.installed else 'no'}")
+    console.print(f"Active: {'yes' if state.active else 'no'}")
+    console.print(f"Autostart: {'yes' if state.enabled else 'no'}")
+    if state.detail:
+        console.print(state.detail)
+
+
+@service_app.command("start")
+def service_start(workspace: Path = typer.Option(Path.cwd(), "--workspace", "-w")) -> None:
+    """Start the installed Gladiator background service."""
+    _service_action(_service_manager(workspace).start)
+
+
+@service_app.command("stop")
+def service_stop(workspace: Path = typer.Option(Path.cwd(), "--workspace", "-w")) -> None:
+    """Stop the installed Gladiator background service."""
+    _service_action(_service_manager(workspace).stop)
+
+
+@service_app.command("restart")
+def service_restart(workspace: Path = typer.Option(Path.cwd(), "--workspace", "-w")) -> None:
+    """Restart the installed Gladiator background service."""
+    _service_action(_service_manager(workspace).restart)
+
+
+@service_app.command("uninstall")
+def service_uninstall(workspace: Path = typer.Option(Path.cwd(), "--workspace", "-w")) -> None:
+    """Disable and remove the Gladiator background service."""
+    _service_action(_service_manager(workspace).uninstall)
 
 
 @todo_app.command("show")
