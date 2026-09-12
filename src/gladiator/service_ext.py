@@ -18,6 +18,7 @@ class ExtendedGladiatorService(GladiatorService):
         super().__init__(*args, **kwargs)
         self.session_path = self.state_dir / "session.json"
         self.session = load_or_create_session(self.session_path)
+        self.model.session_id = self.session.session_id
         self._restore_trajectory()
         self._install_bot_extensions()
 
@@ -72,12 +73,14 @@ class ExtendedGladiatorService(GladiatorService):
             self.agent.n_consecutive_format_errors = 0
             self.agent.extra_template_vars.clear()
             self.cache_stats = CacheStats()
+            self.model.reset_cache_metrics()
             for path in (self.state_dir / "trajectory.json", self.state_dir / "contextAfterCompact.md"):
                 try:
                     path.unlink()
                 except FileNotFoundError:
                     pass
             self.session = rotate_session(self.session_path)
+            self.model.session_id = self.session.session_id
             await self.bot.client.send_message(
                 chat_id,
                 "<b>New Gladiator session.</b> Conversation context was cleared; workspace files, skills, and settings were kept."
@@ -113,6 +116,7 @@ class ExtendedGladiatorService(GladiatorService):
             f"Prompt cache hit ratio: <b>{cache_text}</b>\n"
             f"Cached / prompt tokens: {self.cache_stats.cached_tokens:,} / {self.cache_stats.prompt_tokens:,}\n"
             f"Cache-write tokens: {self.cache_stats.cache_write_tokens:,}\n"
+            f"Response cache: <code>{html.escape(self.model.last_response_cache_status or 'not reported')}</code>\n"
             f"Ask timeout: {self.config.runtime.escalation_timeout_seconds // 60} min\n"
             f"Compact target: {self.config.runtime.compact_threshold_tokens:,} tokens\n"
             f"Search: <code>{self.config.search.mode}</code>\n"
