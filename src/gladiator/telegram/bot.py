@@ -35,6 +35,14 @@ class IncomingTask:
     text: str
     image_paths: list[Path] = field(default_factory=list)
     file_paths: list[Path] = field(default_factory=list)
+    source_message_count: int = 1
+
+
+@dataclass(slots=True)
+class _PendingBurst:
+    parts: list[IncomingTask]
+    first_received_at: float
+    flush_task: asyncio.Task[None] | None = None
 
 
 TaskHandler = Callable[[int, IncomingTask], Awaitable[None]]
@@ -64,6 +72,7 @@ class TelegramBotRuntime:
         self.pairing_code = f"{secrets.randbelow(900000) + 100000}"
         self._spawned: set[asyncio.Task] = set()
         self._decision_waiters: dict[int, tuple[DecisionRequest, asyncio.Future[str | None]]] = {}
+        self._pending_bursts: dict[int, _PendingBurst] = {}
 
     async def run_forever(self) -> None:
         try:
@@ -83,6 +92,10 @@ class TelegramBotRuntime:
                     self.offset = int(update["update_id"]) + 1
                     await self._handle_update(update)
         finally:
+            for burst in self._pending_bursts.values():
+                if burst.flush_task is not None:
+                    burst.flush_task.cancel()
+            self._pending_bursts.clear()
             for task in self._spawned:
                 task.cancel()
             await self.client.close()
@@ -96,6 +109,7 @@ class TelegramBotRuntime:
             chat = message.get("chat") or {}
             chat_id = chat.get("id")
             if isinstance(chat_id, int) and self._authorized(chat_id) and data == "gladiator:stop":
+                self._discard_pending_burst(chat_id)
                 await self.on_stop(chat_id)
                 if callback_id:
                     await self.client.answer_callback_query(callback_id, "Stop requested.")
@@ -108,6 +122,7 @@ class TelegramBotRuntime:
             chat = stopped.get("chat") or {}
             chat_id = chat.get("id")
             if isinstance(chat_id, int) and self._authorized(chat_id):
+                self._discard_pending_burst(chat_id)
                 await self.on_stop(chat_id)
             return
 
@@ -128,13 +143,15 @@ class TelegramBotRuntime:
             await self._handle_decision_reply(chat_id, text)
             return
 
-        if text.startswith("/") and await self._handle_command(chat_id, message, text):
-            return
+        if text.startswith("/"):
+            command = text.partition(" ")[0]
+            if command in {"/new", "/stop"}:
+                self._discard_pending_burst(chat_id)
+            if await self._handle_command(chat_id, message, text):
+                return
 
         incoming = await self._build_task(message, text)
-        task = asyncio.create_task(self.on_task(chat_id, incoming))
-        self._spawned.add(task)
-        task.add_done_callback(self._spawned.discard)
+        self._queue_incoming_task(chat_id, incoming)
 
     def _authorized(self, chat_id: int) -> bool:
         return chat_id in self.config.telegram.allowed_user_ids
@@ -227,6 +244,59 @@ class TelegramBotRuntime:
             return True
         return False
 
+    def _queue_incoming_task(self, chat_id: int, incoming: IncomingTask) -> None:
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        burst = self._pending_bursts.get(chat_id)
+        if burst is None:
+            burst = _PendingBurst(parts=[incoming], first_received_at=now)
+            self._pending_bursts[chat_id] = burst
+        else:
+            burst.parts.append(incoming)
+            if burst.flush_task is not None:
+                burst.flush_task.cancel()
+
+        debounce = float(self.config.runtime.telegram_input_debounce_seconds)
+        max_burst = max(debounce, float(self.config.runtime.telegram_input_max_burst_seconds))
+        elapsed = max(0.0, now - burst.first_received_at)
+        delay = max(0.0, min(debounce, max_burst - elapsed))
+        task = asyncio.create_task(self._flush_burst_after(chat_id, burst, delay))
+        burst.flush_task = task
+        self._spawned.add(task)
+        task.add_done_callback(self._spawned.discard)
+
+    async def _flush_burst_after(self, chat_id: int, burst: _PendingBurst, delay: float) -> None:
+        try:
+            if delay > 0:
+                await asyncio.sleep(delay)
+            await self._flush_pending_burst(chat_id, burst)
+        except asyncio.CancelledError:
+            return
+
+    async def _flush_pending_burst(self, chat_id: int, expected: _PendingBurst) -> None:
+        current = self._pending_bursts.get(chat_id)
+        if current is not expected:
+            return
+        self._pending_bursts.pop(chat_id, None)
+        expected.flush_task = None
+        await self.on_task(chat_id, self._merge_incoming_tasks(expected.parts))
+
+    def _discard_pending_burst(self, chat_id: int) -> None:
+        burst = self._pending_bursts.pop(chat_id, None)
+        if burst is not None and burst.flush_task is not None:
+            burst.flush_task.cancel()
+
+    @staticmethod
+    def _merge_incoming_tasks(parts: list[IncomingTask]) -> IncomingTask:
+        texts = [part.text for part in parts if part.text]
+        text = "\n\n".join(texts)
+        if not text:
+            text = "Please inspect the uploaded attachment(s) and help me with them."
+        images = [path for part in parts for path in part.image_paths]
+        files = [path for part in parts for path in part.file_paths]
+        count = sum(max(1, part.source_message_count) for part in parts)
+        return IncomingTask(text=text, image_paths=images, file_paths=files, source_message_count=count)
+
     async def ask_decision(self, chat_id: int, request: DecisionRequest) -> str | None:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[str | None] = loop.create_future()
@@ -299,6 +369,4 @@ class TelegramBotRuntime:
             else:
                 file_paths.append(downloaded)
 
-        if not text:
-            text = "Please inspect the uploaded attachment(s) and help me with them."
         return IncomingTask(text=text, image_paths=image_paths, file_paths=file_paths)
