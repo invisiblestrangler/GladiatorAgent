@@ -57,6 +57,8 @@ class RuntimeConfig(BaseModel):
     shell_observation_char_limit: int = 12_000
     web_observation_char_limit: int = 12_000
     search_result_limit: int = 5
+    telegram_input_debounce_seconds: float = Field(default=1.5, ge=0.05, le=10.0)
+    telegram_input_max_burst_seconds: float = Field(default=5.0, ge=0.1, le=30.0)
 
 
 class GladiatorConfig(BaseModel):
