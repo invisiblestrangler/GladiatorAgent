@@ -8,6 +8,7 @@ from rich.console import Console
 
 from gladiator import __version__
 from gladiator.config import config_path, load_config
+from gladiator.goal import GoalManager
 from gladiator.service_ext import ExtendedGladiatorService
 from gladiator.setup.service import BackgroundServiceManager
 from gladiator.setup.wizard import run_setup
@@ -15,14 +16,20 @@ from gladiator.todo import TodoManager
 
 app = typer.Typer(no_args_is_help=True, help="GladiatorAgent - Telegram-first mini-swe-agent runtime")
 todo_app = typer.Typer(no_args_is_help=True, help="Manage the current workspace task ledger")
+goal_app = typer.Typer(no_args_is_help=True, help="Manage the current session goal")
 service_app = typer.Typer(no_args_is_help=True, help="Manage the persistent background Gladiator service")
 app.add_typer(todo_app, name="todo")
+app.add_typer(goal_app, name="goal")
 app.add_typer(service_app, name="service")
 console = Console()
 
 
 def _workspace_todo() -> TodoManager:
     return TodoManager(Path.cwd() / ".gladiator" / "todo.json")
+
+
+def _workspace_goal() -> GoalManager:
+    return GoalManager(Path.cwd() / ".gladiator" / "goal.json")
 
 
 def _service_manager(workspace: Path) -> BackgroundServiceManager:
@@ -151,6 +158,40 @@ def todo_clear() -> None:
     """Clear the current workspace task ledger."""
     _workspace_todo().clear()
     console.print("Cleared TODO ledger.")
+
+
+@goal_app.command("show")
+def goal_show() -> None:
+    """Show the current session goal."""
+    console.print(_workspace_goal().render())
+
+
+@goal_app.command("set")
+def goal_set(text: str) -> None:
+    """Set or replace the current session goal."""
+    state = _workspace_goal().set(text)
+    console.print(f"Goal set: {state.text}")
+
+
+@goal_app.command("achieved")
+def goal_achieved(reason: str = typer.Option("", "--reason", "-r")) -> None:
+    """Mark the current goal achieved."""
+    state = _workspace_goal().assess("achieved", reason=reason)
+    console.print(f"Goal achieved: {state.text}")
+
+
+@goal_app.command("reopen")
+def goal_reopen(reason: str = typer.Option("", "--reason", "-r")) -> None:
+    """Mark the current goal active again."""
+    state = _workspace_goal().reopen(reason=reason)
+    console.print(f"Goal reopened: {state.text}")
+
+
+@goal_app.command("clear")
+def goal_clear() -> None:
+    """Clear the current session goal."""
+    _workspace_goal().clear()
+    console.print("Cleared session goal.")
 
 
 @app.command()
