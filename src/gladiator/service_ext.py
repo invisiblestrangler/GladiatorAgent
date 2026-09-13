@@ -2,25 +2,36 @@ from __future__ import annotations
 
 import html
 import json
+import re
 import shutil
 import time
 from contextvars import ContextVar
+from difflib import SequenceMatcher
 
 from gladiator.cache_session import CacheStats
 from gladiator.events import AgentEvent, EventKind
+from gladiator.goal import GoalManager, is_continuation_request
 from gladiator.runtime.session import load_or_create_session, rotate_session
 from gladiator.service import GladiatorService
-from gladiator.telegram.bot import TELEGRAM_COMMANDS
+from gladiator.telegram.bot import IncomingTask, TELEGRAM_COMMANDS
 from gladiator.telegram.renderer import markdown_to_telegram_html, telegram_message_parts
 from gladiator.todo import TodoManager
 
+_GOAL_MARKER_RE = re.compile(r"(?:^|\n)\s*\[\[GLADIATOR_GOAL:\s*(achieved|incomplete)\s*\]\]\s*$", re.IGNORECASE)
+
 
 class ExtendedGladiatorService(GladiatorService):
-    """Gladiator service with persistent sessions, restore, /new, /todo, and cache telemetry."""
+    """Gladiator service with persistent sessions, goals, restore, TODOs, and cache telemetry."""
 
     def __init__(self, *args, **kwargs):
         self.cache_stats = CacheStats()
         self._task_started_at: ContextVar[float | None] = ContextVar("gladiator_task_started_at", default=None)
+        self._previous_final: ContextVar[str] = ContextVar("gladiator_previous_final", default="")
+        self._continuation_work_required: ContextVar[bool] = ContextVar(
+            "gladiator_continuation_work_required", default=False
+        )
+        self._duplicate_suppressed: ContextVar[bool] = ContextVar("gladiator_duplicate_suppressed", default=False)
+        self._goal_assessment: ContextVar[str | None] = ContextVar("gladiator_goal_assessment", default=None)
         self._last_task_elapsed_seconds: float | None = None
         self._session_task_elapsed_seconds = 0.0
         self._session_task_count = 0
@@ -28,9 +39,10 @@ class ExtendedGladiatorService(GladiatorService):
         self.session_path = self.state_dir / "session.json"
         self.session = load_or_create_session(self.session_path)
         self.todo_manager = TodoManager(self.state_dir / "todo.json")
+        self.goal_manager = GoalManager(self.state_dir / "goal.json")
         self._restore_trajectory()
         self._install_bot_extensions()
-        self._install_native_context_command()
+        self._install_native_runtime_commands()
 
     def _emit_from_agent_thread(self, event: AgentEvent) -> None:
         if event.kind == EventKind.RESPONSE_FINISHED:
@@ -40,15 +52,21 @@ class ExtendedGladiatorService(GladiatorService):
         super()._emit_from_agent_thread(event)
 
     @staticmethod
-    def _install_native_context_command() -> None:
+    def _install_native_runtime_commands() -> None:
         if not any(name == "context" for name, _description in TELEGRAM_COMMANDS):
             TELEGRAM_COMMANDS.insert(2, ("context", "Show current context usage"))
+        if not any(name == "goal" for name, _description in TELEGRAM_COMMANDS):
+            TELEGRAM_COMMANDS.insert(3, ("goal", "Show or set the session goal"))
+
+    # Backward-compatible name used by older tests/callers.
+    _install_native_context_command = _install_native_runtime_commands
 
     def _install_bot_extensions(self) -> None:
         original = self.bot._handle_command
 
         async def command_handler(chat_id: int, message: dict, text: str) -> bool:
-            command = text.partition(" ")[0]
+            command, _, argument = text.partition(" ")
+            argument = argument.strip()
             if command == "/new":
                 await self.handle_new_session(chat_id)
                 return True
@@ -58,6 +76,9 @@ class ExtendedGladiatorService(GladiatorService):
                     "<b>Task ledger</b>\n<pre>" + html.escape(self.todo_manager.render()) + "</pre>",
                 )
                 return True
+            if command == "/goal":
+                await self._handle_goal_command(chat_id, argument)
+                return True
             if command == "/context":
                 await self.bot.client.send_message(chat_id, self._context_html())
                 return True
@@ -66,6 +87,7 @@ class ExtendedGladiatorService(GladiatorService):
                 await self.bot.client.send_message(
                     chat_id,
                     "/context — show current context usage\n"
+                    "/goal [set TEXT|clear|reopen] — show/manage the session goal\n"
                     "/new — start a clean agent session\n"
                     "/todo — show the current task ledger",
                 )
@@ -73,6 +95,34 @@ class ExtendedGladiatorService(GladiatorService):
 
         self.bot._handle_command = command_handler  # type: ignore[method-assign]
         self.bot._status_html = self._extended_status_html  # type: ignore[method-assign]
+
+    async def _handle_goal_command(self, chat_id: int, argument: str) -> None:
+        lowered = argument.lower()
+        if not argument:
+            body = self.goal_manager.render()
+        elif lowered == "clear":
+            self.goal_manager.clear()
+            body = "Session goal cleared."
+        elif lowered == "reopen":
+            try:
+                state = self.goal_manager.reopen(reason="Reopened by user from Telegram.")
+                body = f"Goal reopened: {state.text}"
+            except ValueError as exc:
+                body = str(exc)
+        elif lowered == "achieved":
+            try:
+                state = self.goal_manager.assess("achieved", reason="Marked achieved by user from Telegram.")
+                body = f"Goal marked achieved: {state.text}"
+            except ValueError as exc:
+                body = str(exc)
+        else:
+            goal_text = argument[4:].strip() if lowered.startswith("set ") else argument
+            try:
+                state = self.goal_manager.set(goal_text, reason="Set by user from Telegram.")
+                body = f"Goal set: {state.text}"
+            except ValueError as exc:
+                body = str(exc)
+        await self.bot.client.send_message(chat_id, "<b>Session goal</b>\n<pre>" + html.escape(body) + "</pre>")
 
     def _restore_trajectory(self) -> None:
         path = self.state_dir / "trajectory.json"
@@ -90,26 +140,194 @@ class ExtendedGladiatorService(GladiatorService):
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return
 
-    async def handle_task(self, chat_id: int, incoming) -> None:
+    async def handle_task(self, chat_id: int, incoming: IncomingTask) -> None:
         started = time.monotonic()
-        token = self._task_started_at.set(started)
+        timing_token = self._task_started_at.set(started)
+        previous_token = self._previous_final.set(self._latest_final_submission())
+        raw_continuation = is_continuation_request(incoming.text)
+        work_remaining = self._work_remains()
+        continuation_token = self._continuation_work_required.set(raw_continuation and work_remaining)
+        duplicate_token = self._duplicate_suppressed.set(False)
+        assessment_token = self._goal_assessment.set(None)
         try:
-            await super().handle_task(chat_id, incoming)
+            current = self._with_goal_context(
+                incoming,
+                force_continuation=raw_continuation and work_remaining,
+            )
+            for duplicate_retry in range(2):
+                self._duplicate_suppressed.set(False)
+                self._goal_assessment.set(None)
+                await super().handle_task(chat_id, current)
+                if not self._duplicate_suppressed.get():
+                    self._apply_goal_assessment()
+                    break
+
+                self._discard_suppressed_duplicate()
+                if duplicate_retry:
+                    await self.bot.client.send_message(
+                        chat_id,
+                        "<b>Gladiator stopped a repetition loop.</b> The model repeated the previous final answer "
+                        "twice while continuation work was still pending. Check <code>/goal</code> and "
+                        "<code>/todo</code>, then retry.",
+                    )
+                    break
+
+                current = self._with_goal_context(
+                    IncomingTask(
+                        text=(
+                            "Continue execution now. Do not restate or summarize the previous answer. "
+                            "Complete the next unfinished TODO or take the next concrete action toward the active "
+                            "session goal, verify the work, and only then return a new final answer."
+                        )
+                    ),
+                    force_continuation=True,
+                )
         finally:
             elapsed = max(0.0, time.monotonic() - started)
             self._last_task_elapsed_seconds = elapsed
             self._session_task_elapsed_seconds += elapsed
             self._session_task_count += 1
-            self._task_started_at.reset(token)
+            self._goal_assessment.reset(assessment_token)
+            self._duplicate_suppressed.reset(duplicate_token)
+            self._continuation_work_required.reset(continuation_token)
+            self._previous_final.reset(previous_token)
+            self._task_started_at.reset(timing_token)
+
+    def _with_goal_context(self, incoming: IncomingTask, *, force_continuation: bool = False) -> IncomingTask:
+        goal = self.goal_manager.load()
+        open_todos = [item for item in self.todo_manager.list() if not item.done]
+        lines = ["[Gladiator runtime state — control metadata, not user prose]"]
+        if goal is None:
+            lines.append("Session goal: none.")
+            lines.append(
+                "If this request clearly establishes a multi-step objective, set one concise session goal once with "
+                "`gladiator goal set '...'`; do not create a goal for trivial one-step work."
+            )
+        else:
+            lines.append(f"Session goal ({goal.status}): {goal.text}")
+            if goal.status == "active":
+                lines.append("[GLADIATOR_GOAL_TRACKING_REQUIRED]")
+                lines.append(
+                    "Before the final user-facing answer, independently decide whether the SESSION GOAL is actually "
+                    "achieved. Append exactly one final control line: `[[GLADIATOR_GOAL: achieved]]` or "
+                    "`[[GLADIATOR_GOAL: incomplete]]`. The runtime removes this line before displaying the answer."
+                )
+                lines.append(
+                    "Mark achieved only when the objective is genuinely complete; an answer/report alone is not completion."
+                )
+
+        if open_todos:
+            lines.append(f"Open TODOs ({len(open_todos)}):")
+            for item in open_todos[:8]:
+                lines.append(f"- #{item.id} {item.text[:180]}")
+            if len(open_todos) > 8:
+                lines.append(f"- … {len(open_todos) - 8} more; use `gladiator todo show` if needed")
+
+        work_remaining = (goal is not None and goal.status == "active") or bool(open_todos)
+        if force_continuation and work_remaining:
+            lines.append("[GLADIATOR_CONTINUATION_WORK_REQUIRED]")
+            lines.append(
+                "The user is telling you to CONTINUE EXECUTING. Do not repeat, paraphrase, or re-present the previous "
+                "final answer. Immediately work on the next open TODO or next concrete action toward the active goal."
+            )
+        lines.append("[/Gladiator runtime state]")
+        text = incoming.text.rstrip() + "\n\n" + "\n".join(lines)
+        return IncomingTask(
+            text=text,
+            image_paths=list(incoming.image_paths),
+            file_paths=list(incoming.file_paths),
+            source_message_count=incoming.source_message_count,
+        )
+
+    def _work_remains(self) -> bool:
+        goal = self.goal_manager.load()
+        return (goal is not None and goal.status == "active") or self.todo_manager.open_count > 0
+
+    def _latest_final_submission(self) -> str:
+        for message in reversed(self.agent.messages):
+            if message.get("role") == "exit":
+                extra = message.get("extra")
+                if isinstance(extra, dict) and extra.get("exit_status") == "Submitted":
+                    submission = str(extra.get("submission") or message.get("content") or "").strip()
+                    if submission:
+                        return submission
+            if message.get("role") == "assistant" and isinstance(message.get("content"), str):
+                content = str(message.get("content") or "").strip()
+                if content:
+                    return content
+        return ""
+
+    @staticmethod
+    def _extract_goal_marker(text: str) -> tuple[str, str | None]:
+        match = _GOAL_MARKER_RE.search(text)
+        if match is None:
+            return text.strip(), None
+        clean = (text[: match.start()] + text[match.end() :]).strip()
+        return clean, match.group(1).lower()
+
+    @staticmethod
+    def _normalize_for_repeat_check(text: str) -> str:
+        text, _status = ExtendedGladiatorService._extract_goal_marker(text)
+        return " ".join(text.lower().split())
+
+    @classmethod
+    def _substantially_repeats(cls, previous: str, current: str) -> bool:
+        old = cls._normalize_for_repeat_check(previous)
+        new = cls._normalize_for_repeat_check(current)
+        if not old or not new:
+            return False
+        if old == new:
+            return True
+        if min(len(old), len(new)) < 80:
+            return False
+        shorter, longer = (old, new) if len(old) <= len(new) else (new, old)
+        if shorter in longer and len(shorter) / max(1, len(longer)) >= 0.82:
+            return True
+        return SequenceMatcher(None, old, new, autojunk=False).ratio() >= 0.88
+
+    def _discard_suppressed_duplicate(self) -> None:
+        while self.agent.messages and self.agent.messages[-1].get("role") == "exit":
+            self.agent.messages.pop()
+        previous = self._previous_final.get()
+        if self.agent.messages and self.agent.messages[-1].get("role") == "assistant":
+            content = str(self.agent.messages[-1].get("content") or "")
+            if self._substantially_repeats(previous, content):
+                self.agent.messages.pop()
+
+    def _apply_goal_assessment(self) -> None:
+        goal = self.goal_manager.load()
+        if goal is None or goal.status != "active":
+            return
+        assessment = self._goal_assessment.get()
+        if assessment == "achieved":
+            open_count = self.todo_manager.open_count
+            if open_count:
+                self.goal_manager.assess(
+                    "active",
+                    reason=f"Agent assessed achieved, but {open_count} TODO(s) are still open.",
+                )
+            else:
+                self.goal_manager.assess("achieved", reason="Agent assessed the session goal as achieved after this turn.")
+        elif assessment == "incomplete":
+            self.goal_manager.assess("active", reason="Agent assessed the session goal as incomplete after this turn.")
 
     def _final_progress_body(self, status: str, summary: list[str]) -> str:
+        if self._duplicate_suppressed.get():
+            status = "↻ Repeated final rejected; continuing"
         started = self._task_started_at.get()
         if started is not None:
             status = f"{status} · {self._format_elapsed(time.monotonic() - started)}"
         return super()._final_progress_body(status, summary)
 
     async def _send_markdown(self, chat_id: int, text: str) -> None:
-        for part in telegram_message_parts(text):
+        clean, assessment = self._extract_goal_marker(text)
+        if assessment is not None:
+            self._goal_assessment.set(assessment)
+        previous = self._previous_final.get()
+        if self._continuation_work_required.get() and self._substantially_repeats(previous, clean):
+            self._duplicate_suppressed.set(True)
+            return
+        for part in telegram_message_parts(clean):
             await self.bot.client.send_message(chat_id, markdown_to_telegram_html(part))
 
     @staticmethod
@@ -201,10 +419,11 @@ class ExtendedGladiatorService(GladiatorService):
                 except FileNotFoundError:
                     pass
             self.todo_manager.clear()
+            self.goal_manager.clear()
             self.session = rotate_session(self.session_path)
             await self.bot.client.send_message(
                 chat_id,
-                "<b>New Gladiator session.</b> Conversation context and TODO state were cleared; "
+                "<b>New Gladiator session.</b> Conversation context, goal, and TODO state were cleared; "
                 "workspace files, skills, and settings were kept."
                 f"\nSession: <code>{html.escape(self.session.session_id[:20])}…</code>",
             )
@@ -216,6 +435,7 @@ class ExtendedGladiatorService(GladiatorService):
             (self.state_dir / "trajectory.json", "trajectory.json"),
             (self.state_dir / "contextAfterCompact.md", "contextAfterCompact.md"),
             (self.state_dir / "todo.json", "todo.json"),
+            (self.state_dir / "goal.json", "goal.json"),
         ):
             if source.exists():
                 shutil.copy2(source, archive / f"{session_id}.{suffix}")
@@ -229,6 +449,8 @@ class ExtendedGladiatorService(GladiatorService):
             context_tokens = 0
         last_task = "—" if self._last_task_elapsed_seconds is None else self._format_elapsed(self._last_task_elapsed_seconds)
         session_time = self._format_elapsed(self._session_task_elapsed_seconds)
+        goal = self.goal_manager.load()
+        goal_text = "none" if goal is None else f"{goal.status} · {goal.text[:90]}"
         return (
             "<b>Gladiator</b>\n"
             f"Provider: <code>{html.escape(self.config.provider.base_url)}</code>\n"
@@ -237,6 +459,7 @@ class ExtendedGladiatorService(GladiatorService):
             f"Trace: <code>{self.config.runtime.trace_mode}</code>\n"
             "YOLO: <b>on</b>\n"
             f"Session: <code>{html.escape(self.session.session_id[:20])}…</code>\n"
+            f"Goal: <b>{html.escape(goal_text)}</b> · use /goal for details\n"
             f"Context: ~{context_tokens:,} tokens · use /context for details\n"
             f"Last task: {last_task}\n"
             f"Session task time: {session_time} across {self._session_task_count} task(s)\n"
