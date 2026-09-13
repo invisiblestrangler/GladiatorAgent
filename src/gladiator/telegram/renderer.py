@@ -67,3 +67,44 @@ def split_markdown(text: str, limit: int = 3500) -> list[str]:
         current_len += len(line)
     flush()
     return [chunk for chunk in chunks if chunk]
+
+
+def telegram_message_parts(text: str, rendered_limit: int = 3800) -> list[str]:
+    """Return numbered Markdown parts that remain safely below Telegram's message limit.
+
+    Telegram ultimately receives HTML, so raw-Markdown length alone is not enough: escaping
+    ``<``, ``>``, and ``&`` can substantially expand the transmitted text. Re-split with a
+    progressively smaller raw limit until every rendered part is under the conservative
+    rendered-size ceiling. The extra headroom also covers the ``Part N/M`` label.
+    """
+    if not text:
+        return [""]
+
+    label_reserve = 64
+    chunk_rendered_limit = max(512, rendered_limit - label_reserve)
+    raw_limit = min(3200, max(512, len(text)))
+
+    while True:
+        chunks = split_markdown(text, limit=raw_limit)
+        if all(len(markdown_to_telegram_html(chunk)) <= chunk_rendered_limit for chunk in chunks):
+            break
+        if raw_limit <= 256:
+            # HTML escaping expands one source character by at most a small constant factor;
+            # this floor is intentionally very conservative for pathological content.
+            chunks = split_markdown(text, limit=192)
+            break
+        raw_limit = max(256, int(raw_limit * 0.72))
+
+    if len(chunks) == 1:
+        return chunks
+
+    total = len(chunks)
+    parts = [f"Part {index}/{total}\n\n{chunk}" for index, chunk in enumerate(chunks, 1)]
+    # Defensive assertion: keep the contract local to this helper so callers can send directly.
+    if any(len(markdown_to_telegram_html(part)) > rendered_limit for part in parts):
+        # This is only reachable for extremely pathological escaping. Retry once with much
+        # smaller source chunks rather than risking a Telegram-side rejection/truncation.
+        chunks = split_markdown(text, limit=160)
+        total = len(chunks)
+        parts = [f"Part {index}/{total}\n\n{chunk}" for index, chunk in enumerate(chunks, 1)]
+    return parts

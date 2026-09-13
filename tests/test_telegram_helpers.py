@@ -1,11 +1,13 @@
 from collections import deque
+from types import SimpleNamespace
 
 import pytest
 
 from gladiator.service import GladiatorService
+from gladiator.service_ext import ExtendedGladiatorService
 from gladiator.telegram.bot import TELEGRAM_COMMANDS
 from gladiator.telegram.client import TelegramClient
-from gladiator.telegram.renderer import markdown_to_telegram_html, split_markdown
+from gladiator.telegram.renderer import markdown_to_telegram_html, split_markdown, telegram_message_parts
 from gladiator.telegram.traces import TraceHighlighter, reasoning_preview, summarize_shell_command
 
 
@@ -22,6 +24,17 @@ def test_split_markdown_keeps_fences_balanced():
     assert len(chunks) > 1
     for chunk in chunks:
         assert chunk.count("```") % 2 == 0
+
+
+def test_final_response_parts_are_numbered_and_rendered_size_safe():
+    text = "```xml\n" + ("<node>&value</node>\n" * 800) + "```"
+    parts = telegram_message_parts(text, rendered_limit=3800)
+    assert len(parts) > 1
+    assert parts[0].startswith(f"Part 1/{len(parts)}\n\n")
+    assert parts[-1].startswith(f"Part {len(parts)}/{len(parts)}\n\n")
+    for part in parts:
+        assert len(markdown_to_telegram_html(part)) <= 3800
+        assert part.count("```") % 2 == 0
 
 
 def test_trace_highlighter_only_emits_milestones():
@@ -96,9 +109,34 @@ def test_final_progress_summary_preserves_observation_and_recent_results():
     assert "result.png" in body
 
 
+def test_elapsed_formatter_is_human_readable():
+    assert ExtendedGladiatorService._format_elapsed(8.2) == "8s"
+    assert ExtendedGladiatorService._format_elapsed(65) == "1m 05s"
+    assert ExtendedGladiatorService._format_elapsed(3665) == "1h 01m 05s"
+
+
+def test_context_html_prefers_latest_provider_prompt_but_shows_local_estimate():
+    service = object.__new__(ExtendedGladiatorService)
+    service.agent = SimpleNamespace(
+        messages=[{"role": "user", "content": "hello"}],
+        effective_compact_threshold=300_000,
+        estimate_context_tokens=lambda: 118_000,
+    )
+    service.model = SimpleNamespace(last_usage={"prompt_tokens": 123_456})
+    service.config = SimpleNamespace(provider=SimpleNamespace(context_window=500_000))
+
+    rendered = service._context_html()
+    assert "123,456" in rendered
+    assert "118,000" in rendered
+    assert "500,000" in rendered
+    assert "24.7%" in rendered
+    assert "300,000" in rendered
+
+
 def test_native_telegram_command_menu_contains_runtime_controls():
+    ExtendedGladiatorService._install_native_context_command()
     names = {name for name, _description in TELEGRAM_COMMANDS}
-    assert {"status", "model", "reasoning", "trace", "provider", "compact", "new", "todo", "stop"} <= names
+    assert {"status", "context", "model", "reasoning", "trace", "provider", "compact", "new", "todo", "stop"} <= names
 
 
 @pytest.mark.asyncio

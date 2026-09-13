@@ -9,7 +9,9 @@ You run Gladiator beside a local project, message it from Telegram, and let the 
 
 - **Telegram-first coding agent** with image/file input and file/image return.
 - **Native Telegram command menu** registered automatically, so typing `/` shows the available controls.
-- **Live, compact progress cards** with model-intent previews, filenames, tool targets, test status, and an inline Stop button.
+- **Live, compact progress cards** with model-intent previews, filenames, tool targets, test status, elapsed task time, and an inline Stop button.
+- **Telegram-safe long final responses** split into numbered `Part N/M` messages while preserving fenced code blocks.
+- **Context observability** through `/context`, including provider-reported prompt tokens when available, local-history estimates, model-window usage, and distance to compaction.
 - **Supervised background mode** with automatic restart after failures and autostart on Linux reboot / macOS login.
 - **YOLO by default** for routine coding work.
 - **OpenAI-compatible and provider-agnostic** model transport.
@@ -145,7 +147,7 @@ using the code printed by your Gladiator process.
 
 After pairing, simply send the bot a coding task. You can also attach an image or file with the request.
 
-Gladiator registers its native Telegram command menu every time the bot starts. After the bot is online, typing `/` in Telegram shows commands such as `/status`, `/model`, `/reasoning`, `/new`, `/todo`, and `/stop`.
+Gladiator registers its native Telegram command menu every time the bot starts. After the bot is online, typing `/` in Telegram shows commands such as `/status`, `/context`, `/model`, `/reasoning`, `/new`, `/todo`, and `/stop`.
 
 A typical run looks like:
 
@@ -157,13 +159,13 @@ Working…
 
 ↓ when finished
 
-✓ Done
+✓ Done · 42s
 💭 I’ll inspect the auth middleware and its tests first.
 ✓ Reading src/auth/middleware.py
 ✓ Testing tests/test_auth.py
 ```
 
-The separate final Telegram message contains the actual answer. Progress/UI text never becomes model memory.
+The separate final Telegram message contains the actual answer. If that answer is too long for one Telegram message, Gladiator splits it into numbered `Part 1/N`, `Part 2/N`, ... messages using a conservative rendered-size ceiling and keeps fenced code blocks balanced. Progress/UI text and timing data never become model memory.
 
 ### 7. Install the persistent background service (recommended)
 
@@ -220,7 +222,8 @@ After that, the service runs independently of your shell and is supervised by th
 Typing `/` in Telegram displays the registered command list while Gladiator is running.
 
 - `/start` or `/help` — show available controls
-- `/status` — provider/model/reasoning, approximate context size, local session, TODO count, and provider-reported prompt-cache metrics when available
+- `/status` — provider/model/reasoning, approximate context size, task timing, local session, TODO count, and provider-reported prompt-cache metrics when available
+- `/context` — detailed current context usage: latest provider prompt tokens when reported, current local-history estimate, configured context-window percentage, and remaining room before automatic compaction
 - `/model [id]` — show or change model
 - `/reasoning [off|minimal|low|medium|high|xhigh|max|ultra]`
 - `/trace [off|milestones|verbose]`
@@ -230,7 +233,7 @@ Typing `/` in Telegram displays the registered command list while Gladiator is r
 - `/todo` — show the current external task ledger
 - `/stop` — stop the current run
 
-The default `milestones` trace mode is intended for normal use: enough information to observe what the model is doing without dumping its entire reasoning or shell transcript into Telegram.
+The default `milestones` trace mode is intended for normal use: enough information to observe what the model is doing without dumping its entire reasoning or shell transcript into Telegram. Completed, stopped, and failed task cards include elapsed wall-clock time; `/status` also shows the most recent task duration and accumulated runtime task time.
 
 ## Background service behavior
 
@@ -258,6 +261,8 @@ This catches malformed or poisoned tool history locally instead of repeatedly se
 
 When a provider returns HTTP 4xx/5xx, Gladiator preserves a **sanitized provider error body** and surfaces request/provider metadata when the endpoint supplies it. Telegram should therefore show the actual provider reason instead of only a generic `httpx` error and documentation link.
 
+Retryable provider failures that happen **before any stream output begins** are retried automatically with short bounded backoff. Gladiator does not replay a request after streaming has started, avoiding duplicate model/tool execution. If the provider is slow to emit the first stream event, the Working card reports that it is still waiting and then reports when streaming begins.
+
 If a genuinely malformed session from an older version still fails local transcript validation, update Gladiator, restart the service, then use `/new` once to discard the old conversational transcript while keeping workspace files, skills, and settings:
 
 ```bash
@@ -279,19 +284,21 @@ Telegram link previews are disabled for Gladiator progress/final bot messages by
 
 - **YOLO by default.** Routine commands, edits, tests, and implementation choices do not ask for confirmation.
 - **Escalation is exceptional.** Gladiator only pauses for user input when a materially consequential choice remains genuinely unresolved after investigation. If the user does not answer within one hour, Gladiator resumes with the explicitly identified conservative option.
-- **UI is not agent memory.** Telegram typing state, progress traces, message IDs, transport metadata, and formatting never enter model context.
+- **UI is not agent memory.** Telegram typing state, progress traces, message IDs, task timing, transport metadata, and formatting never enter model context.
 - **Filesystem is external memory.** Large outputs and files stay on disk; the model gets bounded relevant excerpts and paths.
 - **No automatic skills.** Skills are only created or modified after an explicit user request.
 - **300k compaction target.** The effective threshold is the smaller of 300k tokens or roughly 82% of the selected model's known context window.
 - **Cache-friendly history.** API-visible history is append-only within a session, keeps the system/tool prefix stable, and excludes UI/reasoning metadata. Gladiator does not inject provider-specific cache or routing controls.
 
-## Sessions and caching
+## Sessions, context, and caching
 
 Gladiator keeps the system prompt, tool schema, and previous API-visible messages stable as a session grows. New information is appended at the tail instead of rewriting prior messages. Telegram/UI events, timestamps, reasoning traces, and `message.extra` metadata are not sent back to the model.
 
+`/context` exposes two complementary measurements without making another model call. When the provider reports OpenAI-compatible usage, Gladiator shows the prompt/input token count from the most recent completed model request. It also shows a provider-agnostic local estimate of the currently stored history. The provider value is generally the best measurement of the last request; the local estimate reflects the current stored conversation and is what Gladiator can always compute even when usage telemetry is absent.
+
 This is intentionally provider-agnostic: Gladiator does not send sticky-routing IDs, cache headers, provider-selection hints, or other vendor-specific cache controls. If a compatible backend implements prefix caching, it can reuse the stable prompt prefix naturally.
 
-The current trajectory and local session ID are persisted under the workspace's `.gladiator/` directory. Restarting Gladiator restores that trajectory. `/new` rotates the local session ID and clears conversation/TODO state; the previous trajectory, compact handoff, and TODO ledger are archived under `.gladiator/sessions/`. Workspace files, global skills, and configuration are left alone.
+The current trajectory and local session ID are persisted under the workspace's `.gladiator/` directory. Restarting Gladiator restores that trajectory. `/new` rotates the local session ID and clears conversation/TODO state and latest provider-context telemetry; the previous trajectory, compact handoff, and TODO ledger are archived under `.gladiator/sessions/`. Workspace files, global skills, and configuration are left alone.
 
 At the compaction boundary Gladiator writes `.gladiator/contextAfterCompact.md`, validates it, and replaces the old message history with a small stable resume context. The first request after compaction is naturally a new prompt prefix; subsequent turns can cache that prefix normally.
 
@@ -357,4 +364,4 @@ The repository also includes a manual GitHub Actions Live E2E workflow for real 
 
 ## Status
 
-GladiatorAgent currently includes the native Telegram command menu, supervised background-service support, Telegram progress/typing feedback, inline cancellation, strict local tool-transcript validation with terminal completion repair, provider error-body diagnostics, provider-agnostic OpenAI-compatible streaming, image/file transfer, provider/model/reasoning controls, context compaction, persistent sessions, provider-reported cache telemetry when available, the external TODO ledger, lazy explicit skills, SearXNG/web extraction, optional Browser Use installation, YOLO execution, and conservative one-hour escalation fallback.
+GladiatorAgent currently includes the native Telegram command menu, supervised background-service support, Telegram progress/typing feedback, elapsed task timing, numbered Telegram-safe long responses, `/context` usage telemetry, inline cancellation, strict local tool-transcript validation with terminal completion repair, provider error-body diagnostics and bounded pre-stream retries, provider-agnostic OpenAI-compatible streaming, image/file transfer, provider/model/reasoning controls, context compaction, persistent sessions, provider-reported cache telemetry when available, the external TODO ledger, lazy explicit skills, SearXNG/web extraction, optional Browser Use installation, YOLO execution, and conservative one-hour escalation fallback.
