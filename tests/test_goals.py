@@ -64,6 +64,34 @@ def test_goal_marker_is_removed_from_visible_answer():
     assert status == "achieved"
 
 
+def test_goal_marker_is_removed_from_persisted_assistant_and_exit_history():
+    service = object.__new__(ExtendedGladiatorService)
+    service.agent = type("AgentStub", (), {})()
+    service.agent.messages = [
+        {
+            "role": "assistant",
+            "content": "Done with the implementation.\n[[GLADIATOR_GOAL: achieved]]",
+            "extra": {},
+        },
+        {
+            "role": "exit",
+            "content": "Done with the implementation.\n[[GLADIATOR_GOAL: achieved]]",
+            "extra": {
+                "exit_status": "Submitted",
+                "submission": "Done with the implementation.\n[[GLADIATOR_GOAL: achieved]]",
+            },
+        },
+    ]
+
+    service._sanitize_goal_marker_from_history()
+
+    assert service.agent.messages[0]["content"] == "Done with the implementation."
+    assert service.agent.messages[0]["extra"]["goal_status"] == "achieved"
+    assert service.agent.messages[1]["content"] == "Done with the implementation."
+    assert service.agent.messages[1]["extra"]["submission"] == "Done with the implementation."
+    assert service.agent.messages[1]["extra"]["goal_status"] == "achieved"
+
+
 def test_repeat_guard_catches_same_report_but_not_new_progress():
     previous = (
         "Refund investigation report. The Stripe account restriction is the primary issue. "
