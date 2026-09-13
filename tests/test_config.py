@@ -18,6 +18,8 @@ def test_config_round_trip(tmp_path: Path):
     assert loaded.telegram.bot_token.get_secret_value() == "telegram-secret"
     assert loaded.runtime.yolo is True
     assert loaded.runtime.escalation_timeout_seconds == 3600
+    assert loaded.runtime.telegram_input_debounce_seconds == 1.5
+    assert loaded.runtime.telegram_input_max_burst_seconds == 5.0
 
 
 def test_reasoning_levels_include_max_and_ultra():
