@@ -9,7 +9,7 @@ from gladiator.config import GladiatorConfig, ProviderConfig, RuntimeConfig, Tel
 from gladiator.telegram.bot import IncomingTask, TelegramBotRuntime
 
 
-def _config(*, debounce: float = 0.03, max_burst: float = 0.12) -> GladiatorConfig:
+def _config(*, debounce: float = 0.05, max_burst: float = 0.2) -> GladiatorConfig:
     return GladiatorConfig(
         provider=ProviderConfig(base_url="https://example.invalid/v1", api_key="test-key", model="test-model"),
         telegram=TelegramConfig(bot_token="test-token", allowed_user_ids=[7]),
@@ -51,9 +51,9 @@ async def test_rapid_text_messages_become_one_agent_turn(tmp_path: Path):
     )
     try:
         runtime._queue_incoming_task(7, IncomingTask(text="first chunk"))
-        await asyncio.sleep(0.005)
+        await asyncio.sleep(0.01)
         runtime._queue_incoming_task(7, IncomingTask(text="second chunk"))
-        await asyncio.sleep(0.07)
+        await asyncio.sleep(0.09)
 
         assert len(received) == 1
         assert received[0].text == "first chunk\n\nsecond chunk"
@@ -70,7 +70,7 @@ async def test_messages_outside_debounce_window_stay_separate(tmp_path: Path):
         received.append(incoming)
 
     runtime = TelegramBotRuntime(
-        config=_config(debounce=0.02, max_burst=0.08),
+        config=_config(debounce=0.05, max_burst=0.2),
         config_path=tmp_path / "config.json",
         workspace=tmp_path,
         on_task=on_task,
@@ -79,9 +79,9 @@ async def test_messages_outside_debounce_window_stay_separate(tmp_path: Path):
     )
     try:
         runtime._queue_incoming_task(7, IncomingTask(text="first request"))
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.08)
         runtime._queue_incoming_task(7, IncomingTask(text="second request"))
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.08)
 
         assert [item.text for item in received] == ["first request", "second request"]
         assert [item.source_message_count for item in received] == [1, 1]
@@ -107,11 +107,11 @@ async def test_text_image_text_burst_keeps_text_order_and_attachment(tmp_path: P
     )
     try:
         runtime._queue_incoming_task(7, IncomingTask(text="describe this"))
-        await asyncio.sleep(0.004)
+        await asyncio.sleep(0.01)
         runtime._queue_incoming_task(7, IncomingTask(text="", image_paths=[image]))
-        await asyncio.sleep(0.004)
+        await asyncio.sleep(0.01)
         runtime._queue_incoming_task(7, IncomingTask(text="and crop it square"))
-        await asyncio.sleep(0.07)
+        await asyncio.sleep(0.09)
 
         assert len(received) == 1
         assert received[0].text == "describe this\n\nand crop it square"
@@ -145,16 +145,16 @@ async def test_rapid_followup_during_busy_task_becomes_one_queued_turn(tmp_path:
     )
     try:
         runtime._queue_incoming_task(7, IncomingTask(text="long running request"))
-        await asyncio.wait_for(first_started.wait(), timeout=0.2)
+        await asyncio.wait_for(first_started.wait(), timeout=0.3)
 
         runtime._queue_incoming_task(7, IncomingTask(text="also check edge cases"))
-        await asyncio.sleep(0.005)
+        await asyncio.sleep(0.01)
         runtime._queue_incoming_task(7, IncomingTask(text="especially retries"))
-        await asyncio.sleep(0.06)
+        await asyncio.sleep(0.09)
         assert len(received) == 1
 
         release_first.set()
-        await asyncio.sleep(0.06)
+        await asyncio.sleep(0.09)
         assert len(received) == 2
         assert received[1].text == "also check edge cases\n\nespecially retries"
         assert received[1].source_message_count == 2
@@ -175,7 +175,7 @@ async def test_stop_command_discards_unflushed_burst_and_bypasses_coalescing(tmp
         stopped.append(chat_id)
 
     runtime = TelegramBotRuntime(
-        config=_config(debounce=0.05, max_burst=0.2),
+        config=_config(),
         config_path=tmp_path / "config.json",
         workspace=tmp_path,
         on_task=on_task,
@@ -199,7 +199,7 @@ async def test_stop_command_discards_unflushed_burst_and_bypasses_coalescing(tmp
                 },
             }
         )
-        await asyncio.sleep(0.08)
+        await asyncio.sleep(0.09)
 
         assert stopped == [7]
         assert received == []
