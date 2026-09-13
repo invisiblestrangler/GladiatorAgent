@@ -133,6 +133,12 @@ class ExtendedGladiatorService(GladiatorService):
                 return int(value)
         return None
 
+    def _cache_average_text(self) -> str:
+        average = self.cache_stats.average_request_hit_ratio
+        if average is None:
+            return "not reported"
+        return f"{average * 100:.1f}% across {self.cache_stats.cache_reporting_requests} request(s)"
+
     def _context_html(self) -> str:
         try:
             estimated = self.agent.estimate_context_tokens() if self.agent.messages else 0
@@ -166,6 +172,7 @@ class ExtendedGladiatorService(GladiatorService):
             f"Compaction target: {compact_target:,} tokens · <b>{threshold_percent:.1f}%</b> used · "
             f"~{until_compact:,} remaining"
         )
+        lines.append(f"Avg provider cache hit / request: <b>{self._cache_average_text()}</b>")
         lines.append("Provider prompt tokens are from the most recent completed model request; the local estimate reflects current stored history.")
         return "\n".join(lines)
 
@@ -232,6 +239,7 @@ class ExtendedGladiatorService(GladiatorService):
             f"Session task time: {session_time} across {self._session_task_count} task(s)\n"
             f"Open TODOs: {self.todo_manager.open_count}\n"
             f"Provider-reported prompt cache hit ratio: <b>{cache_text}</b>\n"
+            f"Avg cache hit / request: <b>{self._cache_average_text()}</b>\n"
             f"Cached / prompt tokens: {self.cache_stats.cached_tokens:,} / {self.cache_stats.prompt_tokens:,}\n"
             f"Cache-write tokens: {self.cache_stats.cache_write_tokens:,}\n"
             f"Ask timeout: {self.config.runtime.escalation_timeout_seconds // 60} min\n"
