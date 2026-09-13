@@ -16,7 +16,7 @@ You can interact with the computer through the bash tool. Work autonomously unti
 If a request can be answered without touching the computer or external tools (for example a greeting, a conversational question, or a capability explanation already known from this harness), answer directly in assistant text and do NOT manufacture a bash call just to finish the turn.
 If the request requires workspace inspection, edits, tests, web/file operations, artifact delivery, or any other computer action, use the bash tool and verify the work.
 Use targeted inspection rather than dumping large files. Execute one focused action at a time and verify changes with tests.
-During working turns, keep assistant prose minimal and tool-focused. Reserve the polished user-facing answer for the final submission instead of narrating the same answer before tools and again afterward.
+During working turns, keep assistant prose minimal and tool-focused. Reserve the polished user-facing answer for the final response instead of narrating the same answer before tools and again afterward.
 For lightweight public-web research, use `gladiator web search QUERY` and `gladiator web fetch URL` as sole bash commands. Prefer these over browser automation.
 For multi-step work, keep a concise external task ledger with `gladiator todo show`, `gladiator todo add '...'`, and `gladiator todo done ID`. Do not create TODOs for trivial one-step tasks, and do not paste the whole ledger into ordinary messages.
 User-created skills are lazy external memory. Use `gladiator skill list` to see names and `gladiator skill read NAME` only when a listed skill is relevant. Never read all skills by default.
@@ -26,9 +26,8 @@ If and ONLY if you are exceptionally uncertain about a materially consequential 
 `gladiator ask --question '...' --option 'choice A' --option 'choice B' --conservative 'choice A' --reason 'why this cannot be resolved safely'`
 The conservative value MUST be one of the options. The runtime may return it automatically if the user does not answer within the configured timeout.
 
-After tool-based work, the preferred explicit completion path is a bash command whose FIRST output line is exactly:
-COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
-Any following output becomes the final message shown to the user. Markdown, including fenced code blocks, is allowed there.
+When tool-based work is complete, return the final user-facing answer directly as ordinary assistant text.
+Do NOT call bash only to submit or print the final answer. Bash is for actual computer actions; the runtime accepts a normal text-only final response after tool work.
 """
 
 INSTANCE_TEMPLATE = r"""
@@ -105,10 +104,9 @@ class GladiatorAgent(DefaultAgent):
         """Execute tool calls while keeping the persisted OpenAI tool transcript structurally complete.
 
         mini-swe's LocalEnvironment raises ``Submitted`` from inside ``execute()`` when the
-        completion marker is printed. DefaultAgent.execute_actions() therefore never gets
-        the chance to append the matching ``role=tool`` observation. That leaves a dangling
-        assistant tool call which breaks the *next* user turn on strict OpenAI-compatible
-        endpoints. Close the tool call before re-raising the terminal submission.
+        legacy completion marker is printed. DefaultAgent.execute_actions() therefore never
+        gets the chance to append the matching ``role=tool`` observation. Keep this path for
+        backwards compatibility even though Gladiator now prefers direct assistant finals.
         """
         actions = list(message.get("extra", {}).get("actions", []))
         outputs: list[dict] = []
@@ -160,7 +158,8 @@ class GladiatorAgent(DefaultAgent):
             popped = self.messages.pop()
             if terminal_exit is None:
                 terminal_exit = popped
-        self._repair_legacy_submitted_tool_gap(terminal_exit)
+        if not self._normalize_terminal_submission_history(terminal_exit):
+            self._repair_legacy_submitted_tool_gap(terminal_exit)
         if not self.messages:
             self.add_messages(
                 self.model.format_message(role="system", content=self._render_template(self.config.system_template)),
@@ -174,6 +173,61 @@ class GladiatorAgent(DefaultAgent):
                 role="user", content=self._user_content(f"New user request:\n{task}", image_paths, file_paths)
             )
         )
+
+    def _normalize_terminal_submission_history(self, terminal_exit: dict | None) -> bool:
+        """Collapse a legacy bash-based final submission into one ordinary assistant turn.
+
+        The completion tool-call/result pair is produced *after* the last provider request and
+        therefore has never been part of an outgoing prompt. Replacing that pair before the
+        next user turn preserves the previous request prefix for caching while removing two
+        stale copies of the old final answer from future model context.
+        """
+        if terminal_exit is None:
+            return False
+        extra = terminal_exit.get("extra")
+        if not isinstance(extra, dict) or extra.get("exit_status") != "Submitted":
+            return False
+        submission = str(extra.get("submission") or terminal_exit.get("content") or "").strip()
+        if not submission or not self.messages:
+            return False
+
+        assistant_index = len(self.messages) - 1
+        tool_message: dict | None = None
+        if self.messages[-1].get("role") == "tool":
+            if len(self.messages) < 2:
+                return False
+            tool_message = self.messages[-1]
+            assistant_index -= 1
+
+        assistant = self.messages[assistant_index]
+        tool_calls = assistant.get("tool_calls")
+        if assistant.get("role") != "assistant" or not isinstance(tool_calls, list) or len(tool_calls) != 1:
+            return False
+        call = tool_calls[0]
+        if not isinstance(call, dict):
+            return False
+        function = call.get("function") or {}
+        try:
+            arguments = json.loads(str(function.get("arguments") or "{}"))
+        except json.JSONDecodeError:
+            return False
+        command = str(arguments.get("command") or "") if isinstance(arguments, dict) else ""
+        if "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" not in command:
+            return False
+        if tool_message is not None:
+            call_id = str(call.get("id") or "")
+            if not call_id or str(tool_message.get("tool_call_id") or "") != call_id:
+                return False
+
+        del self.messages[assistant_index:]
+        self.messages.append(
+            {
+                "role": "assistant",
+                "content": submission,
+                "extra": {"normalized_terminal_submission": True},
+            }
+        )
+        return True
 
     def _repair_legacy_submitted_tool_gap(self, terminal_exit: dict | None) -> None:
         """Repair the exact dangling-call shape written by older Gladiator completion turns.
