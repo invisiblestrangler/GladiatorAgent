@@ -134,10 +134,13 @@ class ExtendedGladiatorService(GladiatorService):
         return None
 
     def _cache_average_text(self) -> str:
-        average = self.cache_stats.average_request_hit_ratio
+        stats = getattr(self, "cache_stats", None)
+        if stats is None:
+            return "not reported"
+        average = stats.average_request_hit_ratio
         if average is None:
             return "not reported"
-        return f"{average * 100:.1f}% across {self.cache_stats.cache_reporting_requests} request(s)"
+        return f"{average * 100:.1f}% across {stats.cache_reporting_requests} request(s)"
 
     def _context_html(self) -> str:
         try:
