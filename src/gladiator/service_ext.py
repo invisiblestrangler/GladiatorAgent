@@ -158,6 +158,7 @@ class ExtendedGladiatorService(GladiatorService):
                 self._duplicate_suppressed.set(False)
                 self._goal_assessment.set(None)
                 await super().handle_task(chat_id, current)
+                self._sanitize_goal_marker_from_history()
                 if not self._duplicate_suppressed.get():
                     self._apply_goal_assessment()
                     break
@@ -201,7 +202,8 @@ class ExtendedGladiatorService(GladiatorService):
             lines.append("Session goal: none.")
             lines.append(
                 "If this request clearly establishes a multi-step objective, set one concise session goal once with "
-                "`gladiator goal set '...'`; do not create a goal for trivial one-step work."
+                "`gladiator goal set '...'`; do not create a goal for trivial one-step work. If you set a goal during "
+                "this turn, append a final `[[GLADIATOR_GOAL: achieved]]` or `[[GLADIATOR_GOAL: incomplete]]` control line."
             )
         else:
             lines.append(f"Session goal ({goal.status}): {goal.text}")
@@ -210,7 +212,8 @@ class ExtendedGladiatorService(GladiatorService):
                 lines.append(
                     "Before the final user-facing answer, independently decide whether the SESSION GOAL is actually "
                     "achieved. Append exactly one final control line: `[[GLADIATOR_GOAL: achieved]]` or "
-                    "`[[GLADIATOR_GOAL: incomplete]]`. The runtime removes this line before displaying the answer."
+                    "`[[GLADIATOR_GOAL: incomplete]]`. The runtime removes this line before displaying or retaining "
+                    "the answer."
                 )
                 lines.append(
                     "Mark achieved only when the objective is genuinely complete; an answer/report alone is not completion."
@@ -264,6 +267,27 @@ class ExtendedGladiatorService(GladiatorService):
             return text.strip(), None
         clean = (text[: match.start()] + text[match.end() :]).strip()
         return clean, match.group(1).lower()
+
+    def _sanitize_goal_marker_from_history(self) -> None:
+        """Keep goal control metadata out of future provider-visible conversation history."""
+        for message in self.agent.messages[-3:]:
+            role = message.get("role")
+            if role not in {"assistant", "exit"}:
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                clean, status = self._extract_goal_marker(content)
+                if status is not None:
+                    message["content"] = clean
+                    extra = message.get("extra")
+                    if isinstance(extra, dict):
+                        extra["goal_status"] = status
+            extra = message.get("extra")
+            if isinstance(extra, dict) and isinstance(extra.get("submission"), str):
+                clean, status = self._extract_goal_marker(str(extra["submission"]))
+                if status is not None:
+                    extra["submission"] = clean
+                    extra["goal_status"] = status
 
     @staticmethod
     def _normalize_for_repeat_check(text: str) -> str:
