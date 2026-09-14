@@ -21,6 +21,7 @@ REASONING_EFFORTS: tuple[ReasoningEffort, ...] = (
 )
 TraceMode = Literal["off", "milestones", "verbose"]
 SearchMode = Literal["none", "local_searxng", "existing_searxng"]
+ProviderMode = Literal["openai_compatible", "codex_oauth"]
 
 
 class ProviderConfig(BaseModel):
@@ -30,6 +31,10 @@ class ProviderConfig(BaseModel):
     model: str
     reasoning_effort: ReasoningEffort = "high"
     context_window: int | None = None
+    mode: ProviderMode = "openai_compatible"
+    codex_access_token: SecretStr = SecretStr("")
+    codex_account_id: str | None = None
+    codex_responses_url: str = "https://chatgpt.com/backend-api/codex/responses"
 
 
 class TelegramConfig(BaseModel):
@@ -86,6 +91,7 @@ def save_config(config: GladiatorConfig, path: Path | None = None) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = config.model_dump(mode="json")
     payload["provider"]["api_key"] = config.provider.api_key.get_secret_value()
+    payload["provider"]["codex_access_token"] = config.provider.codex_access_token.get_secret_value()
     payload["telegram"]["bot_token"] = config.telegram.bot_token.get_secret_value()
     target.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     try:

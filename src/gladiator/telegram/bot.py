@@ -7,9 +7,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
 
+from pydantic import SecretStr
 from rich.console import Console
 
 from gladiator.config import REASONING_EFFORTS, GladiatorConfig, save_config
+from gladiator.models import extract_chatgpt_account_id
 from gladiator.runtime.decision import DecisionRequest
 from gladiator.telegram.client import TelegramClient
 
@@ -22,6 +24,7 @@ TELEGRAM_COMMANDS: list[tuple[str, str]] = [
     ("reasoning", "Show or change reasoning level"),
     ("trace", "Show or change progress trace mode"),
     ("provider", "Show or change OpenAI-compatible endpoint"),
+    ("codex", "Connect or switch Codex subscription auth"),
     ("compact", "Compact context at the next safe boundary"),
     ("new", "Start a clean agent session"),
     ("todo", "Show the current task ledger"),
@@ -179,7 +182,8 @@ class TelegramBotRuntime:
                 "/model [id] — show/change model\n"
                 f"/reasoning [{reasoning_choices}]\n"
                 "/trace [off|milestones|verbose]\n"
-                "/provider [endpoint] [api-key] — show/change OpenAI-compatible provider\n"
+                "/provider [endpoint] [api-key] — use an OpenAI-compatible provider\n"
+                "/codex [connect TOKEN [ACCOUNT_ID]|off|clear] — use Codex subscription OAuth\n"
                 "/compact — compact at the next safe boundary\n"
                 "/new — start a clean agent session\n"
                 "/todo — show the current task ledger\n"
@@ -221,18 +225,21 @@ class TelegramBotRuntime:
             if argument:
                 parts = argument.split(maxsplit=1)
                 self.config.provider.base_url = parts[0].rstrip("/")
+                self.config.provider.mode = "openai_compatible"
                 if len(parts) == 2:
-                    self.config.provider.api_key = parts[1]
-                    try:
-                        await self.client.delete_message(chat_id, int(message["message_id"]))
-                    except Exception:
-                        pass
+                    self.config.provider.api_key = SecretStr(parts[1])
+                    await self._delete_secret_message(chat_id, message)
                 save_config(self.config, self.config_path)
+            active = self.config.provider.mode == "openai_compatible"
             await self.client.send_message(
                 chat_id,
                 f"Provider: <code>{html.escape(self.config.provider.base_url)}</code>\n"
+                f"Mode: <b>{'active' if active else 'stored; Codex OAuth is active'}</b>\n"
                 "API key is stored locally and never shown.",
             )
+            return True
+        if command == "/codex":
+            await self._handle_codex_command(chat_id, message, argument)
             return True
         if command == "/compact":
             await self.on_compact(chat_id)
@@ -243,6 +250,80 @@ class TelegramBotRuntime:
             await self.client.send_message(chat_id, "Stop requested.")
             return True
         return False
+
+    async def _handle_codex_command(self, chat_id: int, message: dict, argument: str) -> None:
+        provider = self.config.provider
+        lowered = argument.lower()
+        if not argument:
+            stored = bool(provider.codex_access_token.get_secret_value())
+            active = provider.mode == "codex_oauth"
+            await self.client.send_message(
+                chat_id,
+                "<b>Codex subscription OAuth</b>\n"
+                f"Connected credential: <b>{'yes' if stored else 'no'}</b>\n"
+                f"Active transport: <b>{'yes' if active else 'no'}</b>\n"
+                "Connect with <code>/codex connect TOKEN</code>. "
+                "If the account id cannot be read from the token, use "
+                "<code>/codex connect TOKEN ACCOUNT_ID</code>.\n"
+                "Use <code>/codex off</code> to switch back to the saved API provider or "
+                "<code>/codex clear</code> to remove the stored OAuth token.",
+            )
+            return
+
+        if lowered == "off":
+            provider.mode = "openai_compatible"
+            save_config(self.config, self.config_path)
+            await self.client.send_message(chat_id, "Codex OAuth transport disabled; saved API provider is active.")
+            return
+
+        if lowered == "clear":
+            provider.mode = "openai_compatible"
+            provider.codex_access_token = SecretStr("")
+            provider.codex_account_id = None
+            save_config(self.config, self.config_path)
+            await self.client.send_message(chat_id, "Codex OAuth credential cleared; saved API provider is active.")
+            return
+
+        values = argument.split()
+        if values and values[0].lower() == "connect":
+            values = values[1:]
+        if values and values[0].lower() == "bearer":
+            values = values[1:]
+        if not values:
+            await self.client.send_message(
+                chat_id,
+                "Usage: <code>/codex connect TOKEN [ACCOUNT_ID]</code>",
+            )
+            return
+
+        await self._delete_secret_message(chat_id, message)
+        access_token = values[0].strip()
+        explicit_account_id = values[1].strip() if len(values) >= 2 else None
+        account_id = explicit_account_id or extract_chatgpt_account_id(access_token)
+        if not account_id:
+            await self.client.send_message(
+                chat_id,
+                "Could not read the ChatGPT account id from that OAuth token. "
+                "Retry with <code>/codex connect TOKEN ACCOUNT_ID</code>.",
+            )
+            return
+
+        provider.codex_access_token = SecretStr(access_token)
+        provider.codex_account_id = account_id
+        provider.mode = "codex_oauth"
+        save_config(self.config, self.config_path)
+        await self.client.send_message(
+            chat_id,
+            "<b>Codex subscription connected.</b> The token message was deleted from Telegram.\n"
+            "Gladiator remains the agent harness; only the model transport changed. "
+            "Use <code>/model</code> and <code>/reasoning</code> normally.",
+        )
+
+    async def _delete_secret_message(self, chat_id: int, message: dict) -> None:
+        try:
+            await self.client.delete_message(chat_id, int(message["message_id"]))
+        except Exception:
+            pass
 
     def _queue_incoming_task(self, chat_id: int, incoming: IncomingTask) -> None:
         loop = asyncio.get_running_loop()
@@ -334,9 +415,14 @@ class TelegramBotRuntime:
             future.set_result(choice)
 
     def _status_html(self) -> str:
+        provider_label = (
+            "Codex subscription OAuth (direct)"
+            if self.config.provider.mode == "codex_oauth"
+            else self.config.provider.base_url
+        )
         return (
             "<b>Gladiator</b>\n"
-            f"Provider: <code>{html.escape(self.config.provider.base_url)}</code>\n"
+            f"Provider: <code>{html.escape(provider_label)}</code>\n"
             f"Model: <code>{html.escape(self.config.provider.model)}</code>\n"
             f"Reasoning: <code>{self.config.provider.reasoning_effort}</code>\n"
             f"Trace: <code>{self.config.runtime.trace_mode}</code>\n"
