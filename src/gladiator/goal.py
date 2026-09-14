@@ -81,6 +81,13 @@ class GoalManager:
         state.status = status
         state.reason = reason.strip()
         state.assessments += 1
+        if status == "achieved":
+            # A completed goal should stop occupying the session's active-goal slot.
+            # Return the completed state to the caller for reporting, then remove the
+            # persistent goal record so the next turn starts with no active goal.
+            state.updated_at = time.time()
+            self.clear()
+            return state
         return self._save(state)
 
     def reopen(self, *, reason: str = "") -> GoalState:

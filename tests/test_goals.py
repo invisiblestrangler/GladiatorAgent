@@ -18,17 +18,18 @@ def test_goal_manager_lifecycle(tmp_path: Path):
     assert state.status == "active"
     assert manager.active is True
 
+    state = manager.assess("active", reason="Still working through acceptance criteria.")
+    assert state.status == "active"
+    assert state.assessments == 1
+    assert "ACTIVE" in manager.render()
+
     state = manager.assess("achieved", reason="All acceptance criteria passed.")
     assert state.status == "achieved"
-    assert state.assessments == 1
-    assert "ACHIEVED" in manager.render()
-
-    state = manager.reopen(reason="A regression was found.")
-    assert state.status == "active"
     assert state.assessments == 2
-
-    manager.clear()
     assert manager.load() is None
+    assert manager.active is False
+    assert manager.render() == "No session goal is set."
+    assert not manager.path.exists()
 
 
 def test_continuation_detector_is_conservative():
@@ -124,7 +125,7 @@ def test_goal_cannot_be_marked_achieved_while_todos_are_open(tmp_path: Path):
     assert "1 TODO" in state.reason
 
 
-def test_goal_is_marked_achieved_when_model_says_so_and_todos_are_done(tmp_path: Path):
+def test_goal_is_auto_removed_when_model_says_achieved_and_todos_are_done(tmp_path: Path):
     service = object.__new__(ExtendedGladiatorService)
     service.goal_manager = GoalManager(tmp_path / "goal.json")
     service.todo_manager = TodoManager(tmp_path / "todo.json")
@@ -134,7 +135,6 @@ def test_goal_is_marked_achieved_when_model_says_so_and_todos_are_done(tmp_path:
 
     service._apply_goal_assessment()
 
-    state = service.goal_manager.load()
-    assert state is not None
-    assert state.status == "achieved"
-    assert state.assessments == 1
+    assert service.goal_manager.load() is None
+    assert service.goal_manager.render() == "No session goal is set."
+    assert not service.goal_manager.path.exists()
