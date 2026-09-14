@@ -9,7 +9,7 @@ from rich.console import Console
 from gladiator import __version__
 from gladiator.config import config_path, load_config
 from gladiator.goal import GoalManager
-from gladiator.service_ext import ExtendedGladiatorService
+from gladiator.service_goal import GoalAwareGladiatorService
 from gladiator.setup.service import BackgroundServiceManager
 from gladiator.setup.wizard import run_setup
 from gladiator.todo import TodoManager
@@ -78,7 +78,7 @@ def run(workspace: Path = typer.Option(Path.cwd(), "--workspace", "-w")) -> None
     if not path.exists():
         run_setup()
     config = load_config(path)
-    service = ExtendedGladiatorService(config=config, config_path=path, workspace=workspace)
+    service = GoalAwareGladiatorService(config=config, config_path=path, workspace=workspace)
     try:
         asyncio.run(service.run_forever())
     except KeyboardInterrupt:
@@ -175,9 +175,9 @@ def goal_set(text: str) -> None:
 
 @goal_app.command("achieved")
 def goal_achieved(reason: str = typer.Option("", "--reason", "-r")) -> None:
-    """Mark the current goal achieved."""
+    """Mark the current goal achieved and remove it from the active session slot."""
     state = _workspace_goal().assess("achieved", reason=reason)
-    console.print(f"Goal achieved: {state.text}")
+    console.print(f"Goal achieved and cleared: {state.text}")
 
 
 @goal_app.command("reopen")
