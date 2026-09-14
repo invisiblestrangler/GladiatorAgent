@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import SecretStr
 
 from gladiator.config import GladiatorConfig, ProviderConfig, TelegramConfig, load_config
 from gladiator.models import CodexOAuthStreamingModel, OpenAICompatibleStreamingModel
@@ -67,7 +68,7 @@ async def test_telegram_codex_off_keeps_credential_for_later(tmp_path: Path):
     runtime = object.__new__(TelegramBotRuntime)
     runtime.config = _config()
     runtime.config.provider.mode = "codex_oauth"
-    runtime.config.provider.codex_access_token = "stored-token"
+    runtime.config.provider.codex_access_token = SecretStr("stored-token")
     runtime.config.provider.codex_account_id = "acct-123"
     runtime.config_path = tmp_path / "config.json"
     runtime.client = _FakeTelegramClient()
@@ -81,7 +82,7 @@ async def test_telegram_codex_off_keeps_credential_for_later(tmp_path: Path):
 def test_service_uses_codex_transport_without_replacing_gladiator_harness(tmp_path: Path):
     config = _config()
     config.provider.mode = "codex_oauth"
-    config.provider.codex_access_token = "oauth-token"
+    config.provider.codex_access_token = SecretStr("oauth-token")
     config.provider.codex_account_id = "acct-123"
     service = GladiatorService(config=config, config_path=tmp_path / "config.json", workspace=tmp_path / "workspace")
 
