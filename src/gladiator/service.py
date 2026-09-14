@@ -13,7 +13,7 @@ from gladiator.agent import GladiatorAgent
 from gladiator.config import GladiatorConfig, data_root
 from gladiator.environment import GladiatorLocalEnvironment
 from gladiator.events import AgentEvent, EventKind
-from gladiator.models import OpenAICompatibleStreamingModel
+from gladiator.models import CodexOAuthStreamingModel, OpenAICompatibleStreamingModel, extract_chatgpt_account_id
 from gladiator.runtime.decision import DecisionBroker, DecisionRequest, DecisionResult
 from gladiator.skills import SkillManager, user_explicitly_requested_skill_write
 from gladiator.telegram.bot import IncomingTask, TelegramBotRuntime
@@ -38,14 +38,7 @@ class GladiatorService:
         self._current_chat_id: int | None = None
 
         provider = config.provider
-        self.model = OpenAICompatibleStreamingModel(
-            base_url=provider.base_url,
-            api_key=provider.api_key.get_secret_value(),
-            model_name=provider.model,
-            reasoning_effort=provider.reasoning_effort,
-            event_sink=self._emit_from_agent_thread,
-            cancel_event=self.cancel_event,
-        )
+        self.model = self._build_model()
         web_tools = WebTools(
             searxng_url=config.search.searxng_url,
             storage_dir=self.state_dir / "web",
@@ -84,6 +77,36 @@ class GladiatorService:
             on_task=self.handle_task,
             on_stop=self.handle_stop,
             on_compact=self.handle_compact,
+        )
+
+    def _build_model(self) -> OpenAICompatibleStreamingModel:
+        provider = self.config.provider
+        if provider.mode == "codex_oauth":
+            access_token = provider.codex_access_token.get_secret_value()
+            account_id = provider.codex_account_id or extract_chatgpt_account_id(access_token)
+            if not access_token:
+                raise ValueError("Codex OAuth mode is enabled but no access token is stored. Use /codex connect <token>.")
+            if not account_id:
+                raise ValueError(
+                    "Codex OAuth mode is enabled but the ChatGPT account id is unavailable. "
+                    "Reconnect with /codex connect <token> <account-id>."
+                )
+            return CodexOAuthStreamingModel(
+                access_token=access_token,
+                account_id=account_id,
+                responses_url=provider.codex_responses_url,
+                model_name=provider.model,
+                reasoning_effort=provider.reasoning_effort,
+                event_sink=self._emit_from_agent_thread,
+                cancel_event=self.cancel_event,
+            )
+        return OpenAICompatibleStreamingModel(
+            base_url=provider.base_url,
+            api_key=provider.api_key.get_secret_value(),
+            model_name=provider.model,
+            reasoning_effort=provider.reasoning_effort,
+            event_sink=self._emit_from_agent_thread,
+            cancel_event=self.cancel_event,
         )
 
     async def run_forever(self) -> None:
@@ -212,10 +235,26 @@ class GladiatorService:
 
     def _refresh_model_settings(self) -> None:
         provider = self.config.provider
-        self.model.base_url = provider.base_url.rstrip("/")
-        self.model.api_key = provider.api_key.get_secret_value()
-        self.model.model_name = provider.model
-        self.model.reasoning_effort = provider.reasoning_effort
+        wants_codex = provider.mode == "codex_oauth"
+        has_codex = isinstance(self.model, CodexOAuthStreamingModel)
+        if wants_codex != has_codex:
+            self.model = self._build_model()
+            self.agent.model = self.model
+        elif has_codex:
+            access_token = provider.codex_access_token.get_secret_value()
+            account_id = provider.codex_account_id or extract_chatgpt_account_id(access_token)
+            if not account_id:
+                raise ValueError("ChatGPT account id is unavailable. Reconnect with /codex connect <token> <account-id>.")
+            self.model.access_token = access_token  # type: ignore[attr-defined]
+            self.model.account_id = account_id  # type: ignore[attr-defined]
+            self.model.responses_url = provider.codex_responses_url  # type: ignore[attr-defined]
+            self.model.model_name = provider.model
+            self.model.reasoning_effort = provider.reasoning_effort
+        else:
+            self.model.base_url = provider.base_url.rstrip("/")
+            self.model.api_key = provider.api_key.get_secret_value()
+            self.model.model_name = provider.model
+            self.model.reasoning_effort = provider.reasoning_effort
         self.agent.config.model_context_window = provider.context_window
 
     def _drain_event_queue(self) -> None:
