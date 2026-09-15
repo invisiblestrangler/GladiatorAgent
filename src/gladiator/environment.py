@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Callable
 
 from gladiator.events import AgentEvent, EventKind, EventSink, null_event_sink
+from gladiator.mentor import MentorRequest
 from gladiator.runtime.context import ObservationLimiter
 from gladiator.runtime.decision import DecisionRequest, DecisionResult
 from gladiator.skills import SkillManager
@@ -13,6 +14,7 @@ from minisweagent.environments.local import LocalEnvironment
 
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 DecisionHandler = Callable[[DecisionRequest], DecisionResult]
+MentorHandler = Callable[[MentorRequest], str]
 
 
 class GladiatorLocalEnvironment(LocalEnvironment):
@@ -24,6 +26,7 @@ class GladiatorLocalEnvironment(LocalEnvironment):
         observation_char_limit: int = 12_000,
         event_sink: EventSink = null_event_sink,
         decision_handler: DecisionHandler | None = None,
+        mentor_handler: MentorHandler | None = None,
         web_tools: WebTools | None = None,
         skill_manager: SkillManager | None = None,
         **kwargs,
@@ -33,6 +36,7 @@ class GladiatorLocalEnvironment(LocalEnvironment):
         self.event_sink = event_sink
         self.workspace_root = workspace_root.resolve()
         self.decision_handler = decision_handler
+        self.mentor_handler = mentor_handler
         self.web_tools = web_tools
         self.skill_manager = skill_manager
         self.skill_write_authorized = False
@@ -42,6 +46,7 @@ class GladiatorLocalEnvironment(LocalEnvironment):
         special = (
             self._artifact_command(command, cwd=cwd)
             or self._decision_command(command)
+            or self._mentor_command(command, cwd=cwd)
             or self._web_command(command)
             or self._skill_command(command, cwd=cwd)
         )
@@ -69,40 +74,66 @@ class GladiatorLocalEnvironment(LocalEnvironment):
         )
         return result
 
+    @staticmethod
+    def _reserved_pair_index(args: list[str], operation: str) -> int | None:
+        for index in range(max(0, len(args) - 1)):
+            if args[index : index + 2] == ["gladiator", operation]:
+                return index
+        return None
+
     def _artifact_command(self, command: str, *, cwd: str) -> dict | None:
         try:
             args = shlex.split(command)
         except ValueError:
             return None
-        if len(args) != 3 or args[:2] != ["gladiator", "send"]:
+        pair_index = self._reserved_pair_index(args, "send")
+        if pair_index is None:
             return None
+        if pair_index != 0:
+            return self._bad_artifact_command("gladiator send must be the sole command, not part of a compound shell command")
+        if len(args) < 3:
+            return self._bad_artifact_command("Usage: gladiator send PATH [PATH ...]")
+
         base = Path(cwd or self.config.cwd or self.workspace_root)
-        path = Path(args[2]).expanduser()
-        if not path.is_absolute():
-            path = base / path
-        path = path.resolve()
-        try:
-            path.relative_to(self.workspace_root)
-        except ValueError:
-            return {
-                "output": f"Refused to send file outside workspace root: {path}",
-                "returncode": 2,
-                "exception_info": "artifact path outside workspace",
-            }
-        if not path.is_file():
-            return {
-                "output": f"File does not exist: {path}",
-                "returncode": 2,
-                "exception_info": "artifact not found",
-            }
-        self.event_sink(
-            AgentEvent(
-                EventKind.ARTIFACT_READY,
-                str(path),
-                {"path": str(path), "is_image": path.suffix.lower() in _IMAGE_EXTENSIONS},
+        paths: list[Path] = []
+        for raw_path in args[2:]:
+            path = Path(raw_path).expanduser()
+            if not path.is_absolute():
+                path = base / path
+            path = path.resolve()
+            try:
+                path.relative_to(self.workspace_root)
+            except ValueError:
+                return {
+                    "output": f"Refused to send file outside workspace root: {path}",
+                    "returncode": 2,
+                    "exception_info": "artifact path outside workspace",
+                }
+            if not path.is_file():
+                return {
+                    "output": f"File does not exist: {path}",
+                    "returncode": 2,
+                    "exception_info": "artifact not found",
+                }
+            paths.append(path)
+
+        for path in paths:
+            self.event_sink(
+                AgentEvent(
+                    EventKind.ARTIFACT_READY,
+                    str(path),
+                    {"path": str(path), "is_image": path.suffix.lower() in _IMAGE_EXTENSIONS},
+                )
             )
-        )
-        return {"output": f"Queued file for user delivery: {path}", "returncode": 0, "exception_info": ""}
+        if len(paths) == 1:
+            output = f"Queued file for user delivery: {paths[0]}"
+        else:
+            output = "Queued files for user delivery:\n" + "\n".join(f"- {path}" for path in paths)
+        return {"output": output, "returncode": 0, "exception_info": ""}
+
+    @staticmethod
+    def _bad_artifact_command(message: str) -> dict:
+        return {"output": message, "returncode": 2, "exception_info": "invalid artifact send command"}
 
     def _decision_command(self, command: str) -> dict | None:
         try:
@@ -156,6 +187,75 @@ class GladiatorLocalEnvironment(LocalEnvironment):
             "exception_info": "",
             "extra": {"decision_timed_out": result.timed_out, "decision_choice": result.choice},
         }
+
+    def _mentor_command(self, command: str, *, cwd: str) -> dict | None:
+        try:
+            args = shlex.split(command)
+        except ValueError:
+            return None
+        pair_index = self._reserved_pair_index(args, "mentor")
+        if pair_index is None:
+            return None
+        if pair_index != 0:
+            return self._bad_mentor_command("gladiator mentor must be the sole command")
+        if len(args) < 4:
+            return self._bad_mentor_command(
+                "Usage: gladiator mentor --question QUESTION [--file PATH ...] [--log PATH ...]"
+            )
+
+        question = ""
+        files: list[Path] = []
+        logs: list[Path] = []
+        base = Path(cwd or self.config.cwd or self.workspace_root)
+        index = 2
+        while index < len(args):
+            key = args[index]
+            if index + 1 >= len(args):
+                return self._bad_mentor_command(f"Missing value for {key}")
+            value = args[index + 1]
+            if key == "--question":
+                question = value.strip()
+            elif key in {"--file", "--log"}:
+                path = Path(value).expanduser()
+                if not path.is_absolute():
+                    path = base / path
+                path = path.resolve()
+                (files if key == "--file" else logs).append(path)
+            else:
+                return self._bad_mentor_command(f"Unknown mentor argument: {key}")
+            index += 2
+        if not question:
+            return self._bad_mentor_command("--question is required")
+        if self.mentor_handler is None:
+            return {
+                "output": "Mentor is unavailable in this runtime.",
+                "returncode": 2,
+                "exception_info": "mentor unavailable",
+            }
+
+        self.event_sink(AgentEvent(EventKind.TOOL_STARTED, command, {"command": command, "mentor": True}))
+        try:
+            advice = self.mentor_handler(MentorRequest(question=question, files=tuple(files), logs=tuple(logs)))
+        except Exception as exc:
+            self.event_sink(
+                AgentEvent(EventKind.TOOL_FINISHED, data={"command": command, "returncode": 1, "mentor": True})
+            )
+            return {
+                "output": f"Mentor consultation failed: {exc}",
+                "returncode": 1,
+                "exception_info": type(exc).__name__,
+            }
+        self.event_sink(AgentEvent(EventKind.TOOL_FINISHED, data={"command": command, "returncode": 0, "mentor": True}))
+        return {
+            "output": f"<mentor_advice>\n{advice}\n</mentor_advice>",
+            "returncode": 0,
+            "exception_info": "",
+            "extra": {"mentor_advice": True},
+        }
+
+    @staticmethod
+    def _bad_mentor_command(message: str) -> dict:
+        return {"output": f"Invalid gladiator mentor command: {message}", "returncode": 2, "exception_info": "invalid mentor request"}
 
     def _web_command(self, command: str) -> dict | None:
         try:
