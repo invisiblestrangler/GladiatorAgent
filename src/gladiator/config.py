@@ -30,7 +30,12 @@ class ProviderConfig(BaseModel):
     api_key: SecretStr
     model: str
     reasoning_effort: ReasoningEffort = "high"
+    # context_window is the provider-advertised usable/current window used for
+    # compaction safety. max_context_window records a distinct advertised ceiling
+    # when the model catalog exposes one.
     context_window: int | None = None
+    max_context_window: int | None = None
+    context_window_source: str | None = None
     mode: ProviderMode = "openai_compatible"
     codex_access_token: SecretStr = SecretStr("")
     codex_account_id: str | None = None
