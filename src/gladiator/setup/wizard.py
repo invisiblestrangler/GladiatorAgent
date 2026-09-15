@@ -17,6 +17,7 @@ from gladiator.config import (
     config_root,
     save_config,
 )
+from gladiator.model_context import apply_model_context, discover_model_context, format_model_context
 from gladiator.setup.browser import install_browser_use
 from gladiator.setup.docker import DockerManager
 from gladiator.setup.searxng import SearxngManager
@@ -142,6 +143,18 @@ def run_setup(*, destination: Path | None = None) -> Path:
         browser=browser,
         runtime=RuntimeConfig(yolo=True, escalation_timeout_seconds=3600),
     )
+
+    try:
+        context_info = discover_model_context(config.provider)
+    except Exception as exc:  # metadata discovery must never make setup unusable
+        console.print(f"[yellow]Could not detect model context window: {exc}[/yellow]")
+    else:
+        if context_info is not None:
+            apply_model_context(config.provider, context_info)
+            console.print(f"[green]Detected model limits:[/green] {format_model_context(config.provider)}")
+        else:
+            console.print("[yellow]Provider did not advertise a model context window; leaving it unknown.[/yellow]")
+
     saved = save_config(config, path=destination)
     console.print(f"\n[green bold]Setup complete.[/green bold] Configuration saved securely to {saved}")
     console.print("Gladiator runs YOLO by default. It only pauses for genuinely consequential uncertainty;")
