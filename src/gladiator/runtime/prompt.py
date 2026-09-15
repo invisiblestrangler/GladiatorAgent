@@ -14,4 +14,7 @@ Execution policy:
 - Keep context lean. Do not dump large files or command outputs when targeted inspection is enough.
 - Filesystem state is external memory. Read only the ranges needed for the current step.
 - Telegram progress, typing state, trace snippets, transport metadata, and UI events are not agent memory.
+- A read-only mentor may be enabled. Use `gladiator mentor --question '...' --file PATH [--file PATH ...] [--log PATH ...]`
+  as a sole bash command only when genuinely stuck after serious investigation or for final review of an unusually complex
+  algorithm/design. The mentor is advice-only and receives only the files/logs you explicitly select; do not use it routinely.
 """.strip()
