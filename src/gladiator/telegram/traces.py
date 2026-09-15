@@ -144,8 +144,14 @@ def summarize_shell_command(command: str, *, max_chars: int = 120) -> str:
     files = _file_names(compact)
 
     if len(args) >= 2 and args[:2] == ["gladiator", "send"]:
-        target = Path(args[2]).name if len(args) >= 3 else "file"
-        return f"Sending {target}"
+        targets = [Path(value).name for value in args[2:] if value and not value.startswith("-")]
+        if not targets:
+            return "Sending file"
+        if len(targets) == 1:
+            return f"Sending {targets[0]}"
+        return f"Sending {targets[0]} +{len(targets) - 1} files"
+    if len(args) >= 2 and args[:2] == ["gladiator", "mentor"]:
+        return _with_extra_files("Consulting mentor with", files) if files else "Consulting mentor"
     if len(args) >= 2 and args[:2] == ["gladiator", "todo"]:
         return "Updating task list"
     if len(args) >= 2 and args[:2] == ["gladiator", "skill"]:
