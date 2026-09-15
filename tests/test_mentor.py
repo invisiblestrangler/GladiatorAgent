@@ -9,7 +9,7 @@ from pydantic import SecretStr
 
 from gladiator.config import GladiatorConfig, MentorConfig, ProviderConfig, TelegramConfig
 from gladiator.environment import GladiatorLocalEnvironment
-from gladiator.mentor import MENTOR_SYSTEM_PROMPT, MentorClient
+from gladiator.mentor import MENTOR_SYSTEM_PROMPT, MentorClient, MentorRequest
 from gladiator.service_goal import GoalAwareGladiatorService
 
 
@@ -29,10 +29,19 @@ class _FakeResponse:
         yield "data: [DONE]"
 
 
+class _FakeCodexResponse(_FakeResponse):
+    def iter_lines(self):
+        yield "data: " + json.dumps(
+            {"type": "response.output_text.delta", "delta": "Prefer the bounded ring buffer."}
+        )
+        yield "data: [DONE]"
+
+
 class _CaptureClient:
     payload = None
     headers = None
     url = None
+    response_class = _FakeResponse
 
     def __init__(self, **_kwargs):
         pass
@@ -47,7 +56,7 @@ class _CaptureClient:
         type(self).url = url
         type(self).headers = headers
         type(self).payload = json
-        return _FakeResponse()
+        return type(self).response_class()
 
 
 class _FakeTelegramClient:
@@ -73,11 +82,10 @@ def test_mentor_openai_request_is_tool_free_and_only_contains_selected_evidence(
     selected.write_text("def lookup(index, key): return index.get(key)\n", encoding="utf-8")
     unselected.write_text("THIS MUST NOT BE SENT", encoding="utf-8")
     mentor = MentorConfig(enabled=True, model="mentor-model", reasoning_effort="high")
+    _CaptureClient.response_class = _FakeResponse
     monkeypatch.setattr("gladiator.mentor.httpx.Client", _CaptureClient)
 
     client = MentorClient(provider=_provider(), mentor=mentor, workspace_root=tmp_path)
-    from gladiator.mentor import MentorRequest
-
     advice = client.consult(MentorRequest(question="Review lookup complexity", files=(selected,)))
 
     assert advice.startswith("Use the indexed lookup")
@@ -88,6 +96,28 @@ def test_mentor_openai_request_is_tool_free_and_only_contains_selected_evidence(
     assert "algorithm.py" in payload["messages"][1]["content"]
     assert "def lookup" in payload["messages"][1]["content"]
     assert "THIS MUST NOT BE SENT" not in payload["messages"][1]["content"]
+
+
+def test_mentor_codex_request_is_direct_tool_free_advice(tmp_path: Path, monkeypatch):
+    provider = _provider()
+    provider.mode = "codex_oauth"
+    provider.codex_access_token = SecretStr("oauth-token")
+    provider.codex_account_id = "acct-123"
+    provider.codex_responses_url = "https://chatgpt.example/codex/responses"
+    mentor = MentorConfig(enabled=True, model="mentor-codex", reasoning_effort="xhigh")
+    _CaptureClient.response_class = _FakeCodexResponse
+    monkeypatch.setattr("gladiator.mentor.httpx.Client", _CaptureClient)
+
+    client = MentorClient(provider=provider, mentor=mentor, workspace_root=tmp_path)
+    advice = client.consult(MentorRequest(question="Review queue design"))
+
+    assert advice == "Prefer the bounded ring buffer."
+    assert _CaptureClient.url == provider.codex_responses_url
+    assert _CaptureClient.headers["ChatGPT-Account-ID"] == "acct-123"
+    assert _CaptureClient.headers["Authorization"] == "Bearer oauth-token"
+    assert _CaptureClient.payload["model"] == "mentor-codex"
+    assert _CaptureClient.payload["instructions"] == MENTOR_SYSTEM_PROMPT
+    assert "tools" not in _CaptureClient.payload
 
 
 def test_mentor_pseudo_command_is_advice_only_and_receives_explicit_files(tmp_path: Path):
