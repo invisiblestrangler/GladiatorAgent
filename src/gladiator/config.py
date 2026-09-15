@@ -37,6 +37,22 @@ class ProviderConfig(BaseModel):
     codex_responses_url: str = "https://chatgpt.com/backend-api/codex/responses"
 
 
+class MentorConfig(BaseModel):
+    """Rare, read-only advisory model configuration.
+
+    Mentor policy/context is assembled only when the agent explicitly invokes the
+    mentor pseudo-command, keeping the main agent's normal prompt/cache prefix small.
+    """
+
+    enabled: bool = False
+    model: str | None = None
+    reasoning_effort: ReasoningEffort = "high"
+    max_files: int = Field(default=8, ge=1, le=24)
+    max_file_chars: int = Field(default=24_000, ge=1_000, le=200_000)
+    max_total_context_chars: int = Field(default=80_000, ge=4_000, le=500_000)
+    max_advice_chars: int = Field(default=12_000, ge=1_000, le=50_000)
+
+
 class TelegramConfig(BaseModel):
     bot_token: SecretStr
     allowed_user_ids: list[int] = Field(default_factory=list)
@@ -72,6 +88,7 @@ class GladiatorConfig(BaseModel):
     search: SearchConfig = Field(default_factory=SearchConfig)
     browser: BrowserConfig = Field(default_factory=BrowserConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    mentor: MentorConfig = Field(default_factory=MentorConfig)
 
 
 def config_root() -> Path:
