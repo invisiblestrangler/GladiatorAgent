@@ -25,6 +25,11 @@ console = Console()
 
 
 class GladiatorService:
+    TYPING_HEARTBEAT_SECONDS = 4.0
+    TYPING_ACTION_TIMEOUT_SECONDS = 2.5
+    PROGRESS_LIVENESS_SECONDS = 20.0
+    FINAL_UI_RETRY_DELAYS = (0.0, 0.6, 1.8)
+
     def __init__(self, *, config: GladiatorConfig, config_path: Path, workspace: Path):
         self.config = config
         self.config_path = config_path
@@ -159,67 +164,95 @@ class GladiatorService:
         async with self._run_lock:
             self._current_chat_id = chat_id
             self.cancel_event.clear()
-            self._refresh_model_settings()
             self.environment.skill_write_authorized = user_explicitly_requested_skill_write(incoming.text)
             self._drain_event_queue()
-            finished = asyncio.Event()
+            try:
+                self._refresh_model_settings()
+            except Exception as exc:
+                self._record_runtime_failure("model setup failed", exc)
+                await self._queue_or_send_failure(chat_id, f"Gladiator could not start the task: {exc}")
+                self.environment.skill_write_authorized = False
+                self._current_chat_id = None
+                return
+
+            await self._flush_pending_deliveries(chat_id)
+            try:
+                progress_message = await self.bot.client.send_message(
+                    chat_id,
+                    "<i>Working…</i>",
+                    reply_markup=self._stop_reply_markup(),
+                )
+            except Exception as exc:
+                self._record_runtime_failure("could not create Telegram progress message", exc)
+                self.environment.skill_write_authorized = False
+                self._current_chat_id = None
+                return
+
+            progress_message_id = int(progress_message["message_id"])
+            events_finished = asyncio.Event()
+            ui_finished = asyncio.Event()
             progress_final = "✓ Done"
             progress_summary: list[str] = []
-            progress_message = await self.bot.client.send_message(
-                chat_id,
-                "<i>Working…</i>",
-                reply_markup=self._stop_reply_markup(),
-            )
-            progress_message_id = int(progress_message["message_id"])
-            typing_task = asyncio.create_task(self._typing_heartbeat(chat_id, finished))
-            event_task = asyncio.create_task(self._consume_events(chat_id, progress_message_id, finished))
+            delivery_summary: list[str] = []
+            typing_task = asyncio.create_task(self._typing_heartbeat(chat_id, ui_finished))
+            event_task = asyncio.create_task(self._consume_events(chat_id, progress_message_id, events_finished))
             try:
-                result = await asyncio.to_thread(
-                    self.agent.run_task,
-                    incoming.text,
-                    image_paths=incoming.image_paths,
-                    file_paths=incoming.file_paths,
-                )
-                status = str(result.get("exit_status") or "Finished")
-                submission = str(result.get("submission") or "").strip()
-                if not submission:
-                    submission = "Cancelled by user." if status == "Cancelled" else f"Gladiator stopped: {status}"
-                if status == "Cancelled":
-                    progress_final = "■ Stopped"
-                elif status not in {"Submitted", "Finished", "Success", "Completed"}:
-                    progress_final = f"⚠ {status}"
-                await self._send_markdown(chat_id, submission)
-            except Exception as exc:
-                progress_final = "⚠ Error"
-                await self.bot.client.send_message(
-                    chat_id,
-                    f"<b>Gladiator error</b>\n<code>{html.escape(str(exc))}</code>",
-                )
-                raise
-            finally:
-                finished.set()
-                for task in (typing_task, event_task):
-                    try:
-                        task_result = await task
-                        if task is event_task and isinstance(task_result, list):
-                            progress_summary = task_result
-                    except asyncio.CancelledError:
-                        pass
-                    except Exception as exc:
-                        console.print(f"[yellow]Telegram progress task failed: {exc}[/yellow]")
-                final_progress = self._final_progress_body(progress_final, progress_summary)
                 try:
-                    await self.bot.client.edit_message_text(
-                        chat_id,
-                        progress_message_id,
-                        markdown_to_telegram_html(final_progress),
+                    result = await asyncio.to_thread(
+                        self.agent.run_task,
+                        incoming.text,
+                        image_paths=incoming.image_paths,
+                        file_paths=incoming.file_paths,
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    progress_final = "⚠ Error"
+                    self._record_runtime_failure("agent task failed", exc)
+                    pending = self._queue_pending_delivery(f"Gladiator error\n\n{exc}")
+                    delivered = await self._try_send_html(
+                        chat_id,
+                        f"<b>Gladiator error</b>\n<code>{html.escape(str(exc))}</code>",
+                    )
+                    if delivered:
+                        self._remove_pending_delivery(pending)
+                    else:
+                        delivery_summary.append("⚠ Error report saved for recovery")
+                else:
+                    status = str(result.get("exit_status") or "Finished")
+                    submission = str(result.get("submission") or "").strip()
+                    if not submission:
+                        submission = "Cancelled by user." if status == "Cancelled" else f"Gladiator stopped: {status}"
+                    if status == "Cancelled":
+                        progress_final = "■ Stopped"
+                    elif status not in {"Submitted", "Finished", "Success", "Completed"}:
+                        progress_final = f"⚠ {status}"
+                    try:
+                        await self._send_markdown(chat_id, submission)
+                    except Exception as exc:
+                        progress_final = "⚠ Delivery failed"
+                        self._record_runtime_failure("final Telegram response delivery failed", exc)
+                        self._queue_pending_delivery(submission)
+                        delivery_summary.append("⚠ Final response saved locally for automatic recovery")
+            finally:
+                events_finished.set()
                 try:
-                    await self.bot.client.edit_message_reply_markup(chat_id, progress_message_id, None)
-                except Exception:
+                    task_result = await event_task
+                    if isinstance(task_result, list):
+                        progress_summary = task_result
+                except asyncio.CancelledError:
                     pass
+                except Exception as exc:
+                    self._record_runtime_failure("Telegram event/progress task failed", exc)
+                    delivery_summary.append("⚠ Progress renderer failed")
+
+                final_progress = self._final_progress_body(progress_final, [*progress_summary, *delivery_summary])
+                await self._finalize_progress_message(chat_id, progress_message_id, final_progress)
+                ui_finished.set()
+                try:
+                    await typing_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    self._record_runtime_failure("typing heartbeat task failed", exc)
                 self.environment.skill_write_authorized = False
                 self._current_chat_id = None
 
@@ -264,14 +297,127 @@ class GladiatorService:
             except asyncio.QueueEmpty:
                 break
 
+    def _record_runtime_failure(self, label: str, exc: Exception) -> None:
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {label}: {type(exc).__name__}: {exc}"
+        console.print(f"[yellow]{line}[/yellow]")
+        try:
+            path = self.state_dir / "runtime-errors.log"
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError:
+            pass
+
+    @property
+    def _pending_delivery_dir(self) -> Path:
+        return self.state_dir / "pending-delivery"
+
+    def _queue_pending_delivery(self, text: str) -> Path:
+        directory = self._pending_delivery_dir
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / f"{time.time_ns()}.md"
+        target.write_text(text.rstrip() + "\n", encoding="utf-8")
+        return target
+
+    @staticmethod
+    def _remove_pending_delivery(path: Path) -> None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+    async def _flush_pending_deliveries(self, chat_id: int) -> None:
+        directory = self._pending_delivery_dir
+        if not directory.exists():
+            return
+        for path in sorted(directory.glob("*.md")):
+            try:
+                text = path.read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                self._record_runtime_failure("could not read pending Telegram delivery", exc)
+                continue
+            if not text:
+                self._remove_pending_delivery(path)
+                continue
+            try:
+                await self.bot.client.send_message(
+                    chat_id,
+                    "<b>Recovered undelivered output from an earlier Gladiator task:</b>",
+                )
+                await self._send_markdown(chat_id, text)
+            except Exception as exc:
+                self._record_runtime_failure("pending Telegram delivery retry failed", exc)
+                return
+            self._remove_pending_delivery(path)
+
+    async def _queue_or_send_failure(self, chat_id: int, text: str) -> None:
+        pending = self._queue_pending_delivery(text)
+        delivered = await self._try_send_html(
+            chat_id,
+            "<b>Gladiator error</b>\n<code>" + html.escape(text) + "</code>",
+        )
+        if delivered:
+            self._remove_pending_delivery(pending)
+
+    async def _try_send_html(self, chat_id: int, text: str) -> bool:
+        try:
+            await self.bot.client.send_message(chat_id, text)
+            return True
+        except Exception as exc:
+            self._record_runtime_failure("Telegram message delivery failed", exc)
+            return False
+
+    async def _finalize_progress_message(self, chat_id: int, message_id: int, final_progress: str) -> None:
+        rendered = markdown_to_telegram_html(final_progress)
+        edited = False
+        for delay in self.FINAL_UI_RETRY_DELAYS:
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                await self.bot.client.edit_message_text(chat_id, message_id, rendered)
+                edited = True
+                break
+            except Exception as exc:
+                last_edit_error = exc
+        if not edited:
+            self._record_runtime_failure("final Telegram progress edit failed", last_edit_error)
+
+        cleared = False
+        for delay in self.FINAL_UI_RETRY_DELAYS:
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                await self.bot.client.edit_message_reply_markup(chat_id, message_id, None)
+                cleared = True
+                break
+            except Exception as exc:
+                last_markup_error = exc
+        if not cleared:
+            self._record_runtime_failure("final Telegram Stop-button removal failed", last_markup_error)
+
     async def _typing_heartbeat(self, chat_id: int, finished: asyncio.Event) -> None:
+        consecutive_failures = 0
         while not finished.is_set():
             try:
-                await self.bot.client.send_chat_action(chat_id, "typing")
-            except Exception:
-                pass
+                await asyncio.wait_for(
+                    self.bot.client.send_chat_action(chat_id, "typing"),
+                    timeout=self.TYPING_ACTION_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError as exc:
+                consecutive_failures += 1
+                if consecutive_failures == 1 or consecutive_failures % 10 == 0:
+                    self._record_runtime_failure("Telegram typing heartbeat timed out", exc)
+            except Exception as exc:
+                consecutive_failures += 1
+                if consecutive_failures == 1 or consecutive_failures % 10 == 0:
+                    self._record_runtime_failure("Telegram typing heartbeat failed", exc)
+            else:
+                if consecutive_failures:
+                    console.print(
+                        f"[green]Telegram typing heartbeat recovered after {consecutive_failures} failure(s).[/green]"
+                    )
+                consecutive_failures = 0
             try:
-                await asyncio.wait_for(finished.wait(), timeout=4.0)
+                await asyncio.wait_for(finished.wait(), timeout=self.TYPING_HEARTBEAT_SECONDS)
             except asyncio.TimeoutError:
                 continue
 
@@ -282,71 +428,89 @@ class GladiatorService:
         turn_preview_buffer = ""
         turn_preview_emitted = False
         first_activity_preview: str | None = None
+        started_at = time.monotonic()
         last_update = 0.0
+        last_liveness = started_at
         last_rendered = "<i>Working…</i>"
+        progress_edit_failures = 0
 
         while not finished.is_set() or not self._events.empty():
+            event: AgentEvent | None = None
             try:
                 event = await asyncio.wait_for(self._events.get(), timeout=0.25)
             except asyncio.TimeoutError:
-                continue
+                pass
 
-            if event.kind == EventKind.REASONING_DELTA:
-                if self.config.runtime.trace_mode == "milestones":
-                    if not turn_preview_emitted:
-                        turn_preview_buffer += event.text
-                        preview = reasoning_preview(turn_preview_buffer)
-                        if preview:
-                            item = f"💭 {preview}"
-                            milestones.append(item)
-                            if first_activity_preview is None:
-                                first_activity_preview = item
-                            turn_preview_emitted = True
-                    for highlight in highlighter.feed(event.text):
-                        item = f"💡 {highlight[:210]}"
-                        if not milestones or milestones[-1] != item:
-                            milestones.append(item)
-                elif self.config.runtime.trace_mode == "verbose":
-                    verbose_reasoning = (verbose_reasoning + event.text)[-1800:]
-            elif event.kind == EventKind.RESPONSE_FINISHED:
-                turn_preview_buffer = ""
-                turn_preview_emitted = False
-            elif event.kind == EventKind.TOOL_STARTED:
-                summary = summarize_shell_command(str(event.data.get("command", "")))
-                milestones.append(f"▶ {summary}")
-            elif event.kind == EventKind.TOOL_FINISHED:
-                summary = summarize_shell_command(str(event.data.get("command", "")))
-                rc = event.data.get("returncode")
-                completed = f"✓ {summary}" if rc == 0 else f"✗ {summary}"
-                started = f"▶ {summary}"
-                if milestones and milestones[-1] == started:
-                    milestones[-1] = completed
-                else:
-                    milestones.append(completed)
-            elif event.kind == EventKind.COMPACTION_STARTED:
-                milestones.append("🧠 Compacting working context…")
-            elif event.kind == EventKind.COMPACTION_FINISHED:
-                milestones.append("✓ Context compacted; continuing")
-            elif event.kind == EventKind.WARNING:
-                milestones.append(f"⚠ {event.text[:220]}")
-            elif event.kind == EventKind.STATUS:
-                if event.data.get("replace_slow_stream"):
-                    milestones = deque(
-                        (item for item in milestones if not item.startswith("⏳ Still waiting for the model")),
-                        maxlen=5,
-                    )
-                item = event.text[:220]
-                if not milestones or milestones[-1] != item:
-                    milestones.append(item)
-            elif event.kind == EventKind.ARTIFACT_READY:
-                path = Path(str(event.data["path"]))
-                await self._send_artifact(chat_id, path, bool(event.data.get("is_image")))
-                milestones.append(f"✓ Sent {path.name}")
+            if event is not None:
+                if event.kind == EventKind.REASONING_DELTA:
+                    if self.config.runtime.trace_mode == "milestones":
+                        if not turn_preview_emitted:
+                            turn_preview_buffer += event.text
+                            preview = reasoning_preview(turn_preview_buffer)
+                            if preview:
+                                item = f"💭 {preview}"
+                                milestones.append(item)
+                                if first_activity_preview is None:
+                                    first_activity_preview = item
+                                turn_preview_emitted = True
+                        for highlight in highlighter.feed(event.text):
+                            item = f"💡 {highlight[:210]}"
+                            if not milestones or milestones[-1] != item:
+                                milestones.append(item)
+                    elif self.config.runtime.trace_mode == "verbose":
+                        verbose_reasoning = (verbose_reasoning + event.text)[-1800:]
+                elif event.kind == EventKind.RESPONSE_FINISHED:
+                    turn_preview_buffer = ""
+                    turn_preview_emitted = False
+                elif event.kind == EventKind.TOOL_STARTED:
+                    summary = summarize_shell_command(str(event.data.get("command", "")))
+                    milestones.append(f"▶ {summary}")
+                elif event.kind == EventKind.TOOL_FINISHED:
+                    summary = summarize_shell_command(str(event.data.get("command", "")))
+                    rc = event.data.get("returncode")
+                    completed = f"✓ {summary}" if rc == 0 else f"✗ {summary}"
+                    started = f"▶ {summary}"
+                    if milestones and milestones[-1] == started:
+                        milestones[-1] = completed
+                    else:
+                        milestones.append(completed)
+                elif event.kind == EventKind.COMPACTION_STARTED:
+                    milestones.append("🧠 Compacting working context…")
+                elif event.kind == EventKind.COMPACTION_FINISHED:
+                    milestones.append("✓ Context compacted; continuing")
+                elif event.kind == EventKind.WARNING:
+                    milestones.append(f"⚠ {event.text[:220]}")
+                elif event.kind == EventKind.STATUS:
+                    if event.data.get("replace_slow_stream"):
+                        milestones = deque(
+                            (item for item in milestones if not item.startswith("⏳ Still waiting for the model")),
+                            maxlen=5,
+                        )
+                    item = event.text[:220]
+                    if not milestones or milestones[-1] != item:
+                        milestones.append(item)
+                elif event.kind == EventKind.ARTIFACT_READY:
+                    path = Path(str(event.data["path"]))
+                    try:
+                        await self._send_artifact(chat_id, path, bool(event.data.get("is_image")))
+                    except Exception as exc:
+                        self._record_runtime_failure(f"artifact delivery failed for {path.name}", exc)
+                        milestones.append(f"⚠ Could not send {path.name}")
+                    else:
+                        milestones.append(f"✓ Sent {path.name}")
 
             now = time.monotonic()
-            if now - last_update < 0.55:
+            should_show_liveness = now - last_liveness >= self.PROGRESS_LIVENESS_SECONDS
+            if event is not None and now - last_update < 0.55 and not should_show_liveness:
                 continue
+            if event is None and not should_show_liveness:
+                continue
+
             body = self._draft_body(milestones, verbose_reasoning)
+            if should_show_liveness:
+                liveness = f"⏱ Still working · {self._format_elapsed_short(now - started_at)}"
+                body = (body + "\n" + liveness) if body else ("Working…\n" + liveness)
+                last_liveness = now
             rendered = markdown_to_telegram_html(body) if body else "<i>Working…</i>"
             if rendered == last_rendered:
                 continue
@@ -359,10 +523,22 @@ class GladiatorService:
                 )
                 last_rendered = rendered
                 last_update = now
-            except Exception:
-                pass
+                progress_edit_failures = 0
+            except Exception as exc:
+                progress_edit_failures += 1
+                if progress_edit_failures == 1 or progress_edit_failures % 10 == 0:
+                    self._record_runtime_failure("Telegram progress edit failed", exc)
 
         return self._summary_items(first_activity_preview, milestones)
+
+    @staticmethod
+    def _format_elapsed_short(seconds: float) -> str:
+        total = max(0, int(seconds))
+        minutes, secs = divmod(total, 60)
+        if minutes < 60:
+            return f"{minutes}m {secs:02d}s" if minutes else f"{secs}s"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}h {minutes:02d}m"
 
     @staticmethod
     def _summary_items(first_activity_preview: str | None, milestones: deque[str]) -> list[str]:
