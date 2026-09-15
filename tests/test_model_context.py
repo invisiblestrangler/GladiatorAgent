@@ -90,7 +90,7 @@ class _GenericClient:
     def get(self, url, *, headers, params=None):
         del headers, params
         if url.endswith("/models/model-x"):
-            return _Response({}, 404)
+            return _Response({"id": "model-x"})
         assert url.endswith("/models")
         return _Response({"data": [{"id": "model-x", "context_length": 196_608}]})
 
