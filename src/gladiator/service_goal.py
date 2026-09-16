@@ -5,7 +5,6 @@ import html
 import json
 import os
 import time
-from collections.abc import Coroutine
 from typing import Any
 
 from gladiator.config import REASONING_EFFORTS, save_config
@@ -41,8 +40,6 @@ class GoalAwareGladiatorService(ExtendedGladiatorService):
         provider = self.config.provider
         if provider.context_window is None or provider.max_context_window is None:
             await self._refresh_model_context(clear_first=False)
-        # Recovery may schedule a new task before Telegram polling begins, so install
-        # the running loop first for agent-thread event delivery.
         self._loop = asyncio.get_running_loop()
         await self._recover_interrupted_goal_execution()
         await super().run_forever()
@@ -238,7 +235,7 @@ class GoalAwareGladiatorService(ExtendedGladiatorService):
 
     async def _recover_interrupted_goal_execution(self) -> None:
         state = self._load_goal_task_state()
-        if state is None or state.get("status") != "running":
+        if state is None or state.get("status") not in {"running", "interrupted"}:
             return
         try:
             chat_id = int(state["chat_id"])
@@ -251,7 +248,7 @@ class GoalAwareGladiatorService(ExtendedGladiatorService):
             status="interrupted",
             chat_id=chat_id,
             recovery_count=previous_count,
-            detail="previous Gladiator process ended while this goal task was marked running",
+            detail="previous Gladiator process ended while this goal task was active",
             started_at=started_at,
         )
 
@@ -275,7 +272,7 @@ class GoalAwareGladiatorService(ExtendedGladiatorService):
         await self._try_send_html(
             chat_id,
             "<b>Recovered an interrupted goal task.</b> The previous Gladiator process ended while execution was "
-            "still marked running. I am resuming the active goal after checking existing work first.",
+            "still active. I am resuming the active goal after checking existing work first.",
         )
         self._spawn_supervised_goal_task(chat_id, recovery_count=next_count, recovered=True)
 
