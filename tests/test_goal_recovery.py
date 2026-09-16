@@ -5,7 +5,6 @@ import json
 import os
 import time
 from threading import Event
-from types import SimpleNamespace
 
 import pytest
 
