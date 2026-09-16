@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import time
 import traceback
 from typing import Any
