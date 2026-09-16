@@ -9,7 +9,7 @@ from rich.console import Console
 from gladiator import __version__
 from gladiator.config import config_path, load_config
 from gladiator.goal import GoalManager
-from gladiator.service_goal import GoalAwareGladiatorService
+from gladiator.service_resilient import ResilientGoalAwareGladiatorService
 from gladiator.setup.service import BackgroundServiceManager
 from gladiator.setup.wizard import run_setup
 from gladiator.todo import TodoManager
@@ -78,7 +78,7 @@ def run(workspace: Path = typer.Option(Path.cwd(), "--workspace", "-w")) -> None
     if not path.exists():
         run_setup()
     config = load_config(path)
-    service = GoalAwareGladiatorService(config=config, config_path=path, workspace=workspace)
+    service = ResilientGoalAwareGladiatorService(config=config, config_path=path, workspace=workspace)
     try:
         asyncio.run(service.run_forever())
     except KeyboardInterrupt:
