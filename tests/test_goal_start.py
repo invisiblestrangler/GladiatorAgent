@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +23,8 @@ class _FakeClient:
 @pytest.mark.asyncio
 async def test_goal_start_launches_active_goal_immediately(tmp_path, monkeypatch):
     service = object.__new__(GoalAwareGladiatorService)
+    service.state_dir = tmp_path
+    service.cancel_event = Event()
     service.goal_manager = GoalManager(tmp_path / "goal.json")
     service.goal_manager.set("Finish the remaining refund work")
     client = _FakeClient()
@@ -43,17 +46,23 @@ async def test_goal_start_launches_active_goal_immediately(tmp_path, monkeypatch
 
     handled = await service.bot._handle_command(7, {}, "/goal start")
     await asyncio.wait_for(started.wait(), timeout=0.2)
+    await asyncio.gather(*tuple(service.bot._spawned))
 
     assert handled is True
     assert received[0][0] == 7
     assert "Start executing the active session goal now" in received[0][1].text
     assert "Do not merely restate" in received[0][1].text
     assert any("Starting the active session goal now" in text for _chat, text in client.messages)
+    state = service._load_goal_task_state()
+    assert state is not None
+    assert state["status"] == "paused"
 
 
 @pytest.mark.asyncio
 async def test_goal_start_without_active_goal_does_not_launch_task(tmp_path, monkeypatch):
     service = object.__new__(GoalAwareGladiatorService)
+    service.state_dir = tmp_path
+    service.cancel_event = Event()
     service.goal_manager = GoalManager(tmp_path / "goal.json")
     client = _FakeClient()
 
