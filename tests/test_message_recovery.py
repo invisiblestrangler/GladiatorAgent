@@ -4,6 +4,7 @@ import json
 import time
 from threading import Event
 
+import httpx
 import pytest
 
 from gladiator.service_resilient import ResilientGoalAwareGladiatorService
@@ -118,23 +119,55 @@ async def test_repeated_ordinary_task_interruptions_stop_automatic_recovery(tmp_
     assert state["status"] == "recovery_stopped"
 
 
-def test_runtime_log_suppresses_only_cosmetic_telegram_noop(tmp_path):
+def _telegram_http_error(description: str, *, credential: str = "SUPERSECRET") -> httpx.HTTPStatusError:
+    request = httpx.Request(
+        "POST",
+        f"https://api.telegram.org/bot{credential}/editMessageReplyMarkup",
+    )
+    response = httpx.Response(
+        400,
+        request=request,
+        json={"ok": False, "error_code": 400, "description": description},
+    )
+    return httpx.HTTPStatusError("Telegram request failed", request=request, response=response)
+
+
+def test_runtime_log_suppresses_cosmetic_telegram_noop_from_response_body(tmp_path):
     service = object.__new__(ResilientGoalAwareGladiatorService)
     service.state_dir = tmp_path
 
     service._record_runtime_failure(
         "final Telegram Stop-button removal failed",
-        RuntimeError("Bad Request: message is not modified"),
+        _telegram_http_error("Bad Request: message is not modified"),
     )
 
-    log_path = tmp_path / "runtime-errors.log"
-    assert not log_path.exists()
+    assert not (tmp_path / "runtime-errors.log").exists()
+
+
+def test_runtime_log_redacts_telegram_credential_but_keeps_actionable_error(tmp_path):
+    service = object.__new__(ResilientGoalAwareGladiatorService)
+    service.state_dir = tmp_path
+    credential = "SUPERSECRET"
+    failure = _telegram_http_error("Bad Request: chat not found", credential=credential)
+
+    service._record_runtime_boundary_failure("Telegram polling failed", failure)
+
+    logged = (tmp_path / "runtime-errors.log").read_text(encoding="utf-8")
+    assert credential not in logged
+    assert "Bad Request: chat not found" in logged
+    assert "Telegram HTTP 400" in logged
+    assert "bot<redacted>" in logged
+
+
+def test_non_telegram_provider_failure_is_logged_verbatim(tmp_path):
+    service = object.__new__(ResilientGoalAwareGladiatorService)
+    service.state_dir = tmp_path
 
     service._record_runtime_failure(
         "agent task failed",
         RuntimeError("Provider HTTP 400: upstream error"),
     )
 
-    logged = log_path.read_text(encoding="utf-8")
+    logged = (tmp_path / "runtime-errors.log").read_text(encoding="utf-8")
     assert "agent task failed" in logged
     assert "Provider HTTP 400: upstream error" in logged
