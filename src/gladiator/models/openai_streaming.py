@@ -235,6 +235,7 @@ class OpenAICompatibleStreamingModel:
         finish_reason: str | None = None
         usage: dict[str, Any] = {}
         stream_started = False
+        sse_chunks = 0
         request_started = time.monotonic()
         slow_notice_sent = Event()
 
@@ -296,6 +297,13 @@ class OpenAICompatibleStreamingModel:
                                     AgentEvent(EventKind.WARNING, "Provider emitted an invalid SSE JSON chunk.")
                                 )
                                 continue
+                            if not isinstance(chunk, dict):
+                                self.event_sink(
+                                    AgentEvent(EventKind.WARNING, "Provider emitted a non-object SSE JSON chunk.")
+                                )
+                                continue
+                            sse_chunks += 1
+                            self._raise_stream_error(chunk, response=response)
                             if isinstance(chunk.get("usage"), dict):
                                 usage = chunk["usage"]
                             choices = chunk.get("choices") or []
@@ -313,6 +321,23 @@ class OpenAICompatibleStreamingModel:
                                 reasoning_parts.append(reasoning)
                                 self.event_sink(AgentEvent(EventKind.REASONING_DELTA, reasoning))
                             self._merge_tool_call_deltas(tool_calls, delta.get("tool_calls") or [])
+
+                        if not content_parts and not reasoning_parts and not tool_calls:
+                            prompt_tokens = self._prompt_tokens_from_usage(usage)
+                            diagnostics = [
+                                f"finish_reason={finish_reason or 'none'}",
+                                f"sse_chunks={sse_chunks}",
+                            ]
+                            if prompt_tokens is not None:
+                                diagnostics.append(f"prompt_tokens={prompt_tokens}")
+                            request_id, provider_family, retry_after_seconds = self._provider_response_metadata(response)
+                            raise ProviderRequestError(
+                                status_code=502,
+                                detail="Provider returned an empty streaming completion (" + ", ".join(diagnostics) + ").",
+                                request_id=request_id,
+                                provider_family=provider_family,
+                                retry_after_seconds=retry_after_seconds,
+                            )
             except ProviderRequestError:
                 raise
             except (httpx.TimeoutException, httpx.TransportError) as exc:
@@ -410,6 +435,45 @@ class OpenAICompatibleStreamingModel:
                 body = str(response.text)
             except Exception:
                 body = ""
+        request_id, provider_family, retry_after_seconds = cls._provider_response_metadata(response)
+        raise ProviderRequestError(
+            status_code=status_code,
+            detail=cls._provider_error_detail(body),
+            request_id=request_id,
+            provider_family=provider_family,
+            retry_after_seconds=retry_after_seconds,
+        )
+
+    @classmethod
+    def _raise_stream_error(cls, chunk: dict[str, Any], *, response: Any) -> None:
+        error = chunk.get("error")
+        if error in (None, "", {}):
+            return
+
+        status_code = 502
+        if isinstance(error, dict):
+            raw_code = error.get("status_code") or error.get("status") or error.get("code")
+            try:
+                parsed_code = int(raw_code)
+            except (TypeError, ValueError):
+                parsed_code = 0
+            if 400 <= parsed_code <= 599:
+                status_code = parsed_code
+            detail = cls._provider_error_detail(json.dumps({"error": error}, ensure_ascii=False, default=str))
+        else:
+            detail = re.sub(r"\s+", " ", str(error)).strip()[:1200] or "provider stream error"
+
+        request_id, provider_family, retry_after_seconds = cls._provider_response_metadata(response)
+        raise ProviderRequestError(
+            status_code=status_code,
+            detail=detail,
+            request_id=request_id,
+            provider_family=provider_family,
+            retry_after_seconds=retry_after_seconds,
+        )
+
+    @staticmethod
+    def _provider_response_metadata(response: Any) -> tuple[str, str, float | None]:
         headers = getattr(response, "headers", {}) or {}
         request_id = str(headers.get("x-request-id") or headers.get("request-id") or "")
         provider_family = str(
@@ -422,13 +486,17 @@ class OpenAICompatibleStreamingModel:
                 retry_after_seconds = max(0.0, float(raw_retry_after))
             except (TypeError, ValueError):
                 retry_after_seconds = None
-        raise ProviderRequestError(
-            status_code=status_code,
-            detail=cls._provider_error_detail(body),
-            request_id=request_id,
-            provider_family=provider_family,
-            retry_after_seconds=retry_after_seconds,
-        )
+        return request_id, provider_family, retry_after_seconds
+
+    @staticmethod
+    def _prompt_tokens_from_usage(usage: dict[str, Any]) -> int | None:
+        for key in ("prompt_tokens", "input_tokens"):
+            value = usage.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)) and value >= 0:
+                return int(value)
+        return None
 
     @staticmethod
     def _provider_error_detail(body: str) -> str:
