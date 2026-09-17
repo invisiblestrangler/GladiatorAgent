@@ -31,6 +31,7 @@ class ResilientGoalAwareGladiatorService(GoalAwareGladiatorService):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._message_dispatch_lock = asyncio.Lock()
         self._install_telegram_runtime_guards()
 
     def _install_telegram_runtime_guards(self) -> None:
@@ -86,7 +87,18 @@ class ResilientGoalAwareGladiatorService(GoalAwareGladiatorService):
         if self._inside_goal_supervisor():
             await super().handle_task(chat_id, incoming)
             return
-        await self._run_tracked_message_task(chat_id, incoming, recovery_count=0, recovered=False)
+
+        queued = self._message_dispatch_lock.locked() or self._run_lock.locked()
+        if queued:
+            await self.bot.client.send_message(chat_id, "Queued behind the current Gladiator task.")
+        async with self._message_dispatch_lock:
+            await self._wait_for_execution_slot()
+            await self._run_tracked_message_task(chat_id, incoming, recovery_count=0, recovered=False)
+
+    async def _wait_for_execution_slot(self) -> None:
+        """Do not mark a queued ordinary turn as active until the shared agent lock is free."""
+        while self._run_lock.locked():
+            await asyncio.sleep(0.1)
 
     @staticmethod
     def _inside_goal_supervisor() -> bool:
@@ -241,6 +253,22 @@ class ResilientGoalAwareGladiatorService(GoalAwareGladiatorService):
                 started_at=started_at,
             )
 
+    async def _run_serialized_message_recovery(
+        self,
+        chat_id: int,
+        incoming: IncomingTask,
+        *,
+        recovery_count: int,
+    ) -> None:
+        async with self._message_dispatch_lock:
+            await self._wait_for_execution_slot()
+            await self._run_tracked_message_task(
+                chat_id,
+                incoming,
+                recovery_count=recovery_count,
+                recovered=True,
+            )
+
     def _spawn_supervised_message_task(
         self,
         chat_id: int,
@@ -249,11 +277,10 @@ class ResilientGoalAwareGladiatorService(GoalAwareGladiatorService):
         recovery_count: int,
     ) -> asyncio.Task[None]:
         task = asyncio.create_task(
-            self._run_tracked_message_task(
+            self._run_serialized_message_recovery(
                 chat_id,
                 incoming,
                 recovery_count=recovery_count,
-                recovered=True,
             ),
             name="gladiator-message-recovery",
         )
