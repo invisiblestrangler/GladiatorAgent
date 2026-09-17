@@ -154,7 +154,7 @@ class OpenAICompatibleStreamingModel:
                 ids = [str(call.get("id") or "") for call in tool_calls if isinstance(call, dict)]
                 if len(ids) != len(tool_calls) or any(not call_id for call_id in ids):
                     raise ToolTranscriptError(f"Invalid local tool transcript at message {index}: missing tool call id.")
-                if len(set(ids)) != len(tool_calls):
+                if len(set(ids)) != len(ids):
                     raise ToolTranscriptError(f"Invalid local tool transcript at message {index}: duplicate tool call ids.")
                 pending = ids
 
