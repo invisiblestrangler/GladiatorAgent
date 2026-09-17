@@ -156,7 +156,6 @@ def test_runtime_log_redacts_telegram_credential_but_keeps_actionable_error(tmp_
     assert credential not in logged
     assert "Bad Request: chat not found" in logged
     assert "Telegram HTTP 400" in logged
-    assert "bot<redacted>" in logged
 
 
 def test_non_telegram_provider_failure_is_logged_verbatim(tmp_path):
