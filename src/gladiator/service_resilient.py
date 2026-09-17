@@ -4,6 +4,7 @@ import asyncio
 import html
 import json
 import os
+import re
 import time
 import traceback
 from pathlib import Path
@@ -347,10 +348,50 @@ class ResilientGoalAwareGladiatorService(GoalAwareGladiatorService):
             + f" · PID <code>{pid}</code> · recoveries {recovery_count}"
         )
 
+    @staticmethod
+    def _telegram_response_description(exc: Exception) -> str:
+        if not isinstance(exc, httpx.HTTPStatusError):
+            return ""
+        try:
+            payload = exc.response.json()
+        except (ValueError, TypeError):
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        for key in ("description", "message", "detail"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return re.sub(r"\s+", " ", value).strip()[:800]
+        return ""
+
+    @staticmethod
+    def _redact_telegram_credentials(text: str) -> str:
+        return re.sub(
+            r"(https://api\.telegram\.org/bot)[^/\s'\"<>]+",
+            r"\1<redacted>",
+            text,
+            flags=re.IGNORECASE,
+        )
+
+    @classmethod
+    def _is_cosmetic_telegram_failure(cls, label: str, exc: Exception) -> bool:
+        if "telegram" not in label.lower():
+            return False
+        detail = cls._telegram_response_description(exc) or str(exc)
+        return "message is not modified" in detail.lower()
+
     def _record_runtime_failure(self, label: str, exc: Exception) -> None:
-        """Keep real failures, but do not let Telegram's harmless no-op edit spam diagnostics."""
-        message = str(exc).lower()
-        if "telegram" in label.lower() and "message is not modified" in message:
+        """Log actionable detail without leaking Telegram credentials or no-op edit noise."""
+        if self._is_cosmetic_telegram_failure(label, exc):
+            return
+        if "telegram" in label.lower():
+            if isinstance(exc, httpx.HTTPStatusError):
+                status = int(exc.response.status_code)
+                detail = self._telegram_response_description(exc) or "request failed"
+                safe_exc = RuntimeError(f"Telegram HTTP {status}: {detail}")
+            else:
+                safe_exc = RuntimeError(self._redact_telegram_credentials(str(exc)))
+            super()._record_runtime_failure(label, safe_exc)
             return
         super()._record_runtime_failure(label, exc)
 
@@ -391,10 +432,13 @@ class ResilientGoalAwareGladiatorService(GoalAwareGladiatorService):
         return int(chat["id"])
 
     def _record_runtime_boundary_failure(self, label: str, exc: Exception) -> None:
+        if self._is_cosmetic_telegram_failure(label, exc):
+            return
         self._record_runtime_failure(label, exc)
         try:
             path = self.state_dir / "runtime-errors.log"
             trace = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            trace = self._redact_telegram_credentials(trace)
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(trace.rstrip() + "\n")
         except OSError:
