@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from threading import Event
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
+from gladiator.service_goal import GoalAwareGladiatorService
 from gladiator.service_resilient import ResilientGoalAwareGladiatorService
 from gladiator.telegram.bot import IncomingTask
 
@@ -117,6 +120,85 @@ async def test_repeated_ordinary_task_interruptions_stop_automatic_recovery(tmp_
     state = service._load_message_task_state()
     assert state is not None
     assert state["status"] == "recovery_stopped"
+
+
+class _RecordingClient:
+    def __init__(self):
+        self.messages: list[tuple[int, str]] = []
+
+    async def send_message(self, chat_id: int, text: str, **_kwargs):
+        self.messages.append((chat_id, text))
+        return {"message_id": len(self.messages)}
+
+
+def _bare_runtime_service(tmp_path) -> ResilientGoalAwareGladiatorService:
+    service = object.__new__(ResilientGoalAwareGladiatorService)
+    service.state_dir = tmp_path
+    service.cancel_event = Event()
+    service._run_lock = asyncio.Lock()
+    service._message_dispatch_lock = asyncio.Lock()
+    service.bot = SimpleNamespace(client=_RecordingClient())
+    return service
+
+
+@pytest.mark.asyncio
+async def test_queued_ordinary_task_does_not_replace_active_recovery_marker(tmp_path, monkeypatch):
+    service = _bare_runtime_service(tmp_path)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def fake_parent_handle_task(self, _chat_id: int, incoming: IncomingTask) -> None:
+        async with self._run_lock:
+            if incoming.text == "first task":
+                first_started.set()
+                await release_first.wait()
+
+    monkeypatch.setattr(GoalAwareGladiatorService, "handle_task", fake_parent_handle_task)
+
+    first = asyncio.create_task(service.handle_task(123, IncomingTask(text="first task")))
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    state = service._load_message_task_state()
+    assert state is not None
+    assert state["status"] == "running"
+    assert state["task_text"] == "first task"
+
+    second = asyncio.create_task(service.handle_task(123, IncomingTask(text="second task")))
+    await asyncio.sleep(0.02)
+    queued_state = service._load_message_task_state()
+    assert queued_state is not None
+    assert queued_state["task_text"] == "first task"
+    assert any("Queued behind" in text for _chat, text in service.bot.client.messages)
+
+    release_first.set()
+    await asyncio.gather(first, second)
+    final_state = service._load_message_task_state()
+    assert final_state is not None
+    assert final_state["status"] == "finished"
+    assert final_state["task_text"] == "second task"
+
+
+@pytest.mark.asyncio
+async def test_ordinary_marker_waits_until_shared_agent_lock_is_free(tmp_path, monkeypatch):
+    service = _bare_runtime_service(tmp_path)
+
+    async def fake_parent_handle_task(self, _chat_id: int, _incoming: IncomingTask) -> None:
+        async with self._run_lock:
+            return
+
+    monkeypatch.setattr(GoalAwareGladiatorService, "handle_task", fake_parent_handle_task)
+    await service._run_lock.acquire()
+    pending = asyncio.create_task(service.handle_task(123, IncomingTask(text="queued task")))
+    await asyncio.sleep(0.02)
+
+    assert not service._message_task_state_path.exists()
+    assert any("Queued behind" in text for _chat, text in service.bot.client.messages)
+
+    service._run_lock.release()
+    await asyncio.wait_for(pending, timeout=1)
+    state = service._load_message_task_state()
+    assert state is not None
+    assert state["status"] == "finished"
+    assert state["task_text"] == "queued task"
 
 
 def _telegram_http_error(description: str, *, credential: str = "SUPERSECRET") -> httpx.HTTPStatusError:
