@@ -75,45 +75,59 @@ class GladiatorLocalEnvironment(LocalEnvironment):
         return result
 
     @staticmethod
-    def _reserved_pair_index(args: list[str], operation: str) -> int | None:
-        for index in range(max(0, len(args) - 1)):
-            if args[index : index + 2] == ["gladiator", operation]:
-                return index
-        return None
-
-    @staticmethod
-    def _has_unquoted_shell_control(command: str) -> bool:
+    def _shell_segments(command: str) -> tuple[list[str], bool]:
+        segments: list[str] = []
+        current: list[str] = []
         quote: str | None = None
         escaped = False
+        has_control = False
+
         for char in command:
             if escaped:
+                current.append(char)
                 escaped = False
                 continue
             if char == "\\" and quote != "'":
+                current.append(char)
                 escaped = True
                 continue
             if quote is not None:
+                current.append(char)
                 if char == quote:
                     quote = None
                 continue
             if char in {"'", '"'}:
+                current.append(char)
                 quote = char
                 continue
             if char in ";&|<>()":
-                return True
-        return False
+                has_control = True
+                segment = "".join(current).strip()
+                if segment:
+                    segments.append(segment)
+                current = []
+                continue
+            current.append(char)
+
+        segment = "".join(current).strip()
+        if segment:
+            segments.append(segment)
+        return segments, has_control
 
     @classmethod
     def _reserved_command_args(cls, command: str, operation: str) -> tuple[list[str], bool] | None:
-        try:
-            args = shlex.split(command)
-        except ValueError:
-            return None
-        pair_index = cls._reserved_pair_index(args, operation)
-        if pair_index is None:
-            return None
-        is_compound = pair_index != 0 or cls._has_unquoted_shell_control(command)
-        return args, is_compound
+        segments, has_control = cls._shell_segments(command)
+        for segment in segments:
+            try:
+                args = shlex.split(segment)
+            except ValueError:
+                continue
+            if args[:2] != ["gladiator", operation]:
+                continue
+            if has_control:
+                return args, True
+            return args, False
+        return None
 
     @staticmethod
     def _bad_reserved_command(operation: str) -> dict:
