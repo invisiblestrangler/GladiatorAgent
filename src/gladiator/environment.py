@@ -75,22 +75,78 @@ class GladiatorLocalEnvironment(LocalEnvironment):
         return result
 
     @staticmethod
-    def _reserved_pair_index(args: list[str], operation: str) -> int | None:
-        for index in range(max(0, len(args) - 1)):
-            if args[index : index + 2] == ["gladiator", operation]:
-                return index
+    def _shell_segments(command: str) -> tuple[list[str], bool]:
+        segments: list[str] = []
+        current: list[str] = []
+        quote: str | None = None
+        escaped = False
+        has_control = False
+
+        for char in command:
+            if escaped:
+                current.append(char)
+                escaped = False
+                continue
+            if char == "\\" and quote != "'":
+                current.append(char)
+                escaped = True
+                continue
+            if quote is not None:
+                current.append(char)
+                if char == quote:
+                    quote = None
+                continue
+            if char in {"'", '"'}:
+                current.append(char)
+                quote = char
+                continue
+            if char in ";&|<>()":
+                has_control = True
+                segment = "".join(current).strip()
+                if segment:
+                    segments.append(segment)
+                current = []
+                continue
+            current.append(char)
+
+        segment = "".join(current).strip()
+        if segment:
+            segments.append(segment)
+        return segments, has_control
+
+    @classmethod
+    def _reserved_command_args(cls, command: str, operation: str) -> tuple[list[str], bool] | None:
+        segments, has_control = cls._shell_segments(command)
+        for segment in segments:
+            try:
+                args = shlex.split(segment)
+            except ValueError:
+                continue
+            if args[:2] != ["gladiator", operation]:
+                continue
+            if has_control:
+                return args, True
+            return args, False
         return None
 
+    @staticmethod
+    def _bad_reserved_command(operation: str) -> dict:
+        return {
+            "output": (
+                f"gladiator {operation} must be the sole command, not part of a compound shell command. "
+                "Do not combine it with cd, &&, ;, pipes, redirections, or shell grouping."
+            ),
+            "returncode": 2,
+            "exception_info": f"invalid {operation} command",
+        }
+
     def _artifact_command(self, command: str, *, cwd: str) -> dict | None:
-        try:
-            args = shlex.split(command)
-        except ValueError:
+        parsed = self._reserved_command_args(command, "send")
+        if parsed is None:
             return None
-        pair_index = self._reserved_pair_index(args, "send")
-        if pair_index is None:
-            return None
-        if pair_index != 0:
-            return self._bad_artifact_command("gladiator send must be the sole command, not part of a compound shell command")
+        args, is_compound = parsed
+        if is_compound:
+            return self._bad_reserved_command("send")
         if len(args) < 3:
             return self._bad_artifact_command("Usage: gladiator send PATH [PATH ...]")
 
@@ -136,12 +192,12 @@ class GladiatorLocalEnvironment(LocalEnvironment):
         return {"output": message, "returncode": 2, "exception_info": "invalid artifact send command"}
 
     def _decision_command(self, command: str) -> dict | None:
-        try:
-            args = shlex.split(command)
-        except ValueError:
+        parsed = self._reserved_command_args(command, "ask")
+        if parsed is None:
             return None
-        if len(args) < 3 or args[:2] != ["gladiator", "ask"]:
-            return None
+        args, is_compound = parsed
+        if is_compound:
+            return self._bad_reserved_command("ask")
 
         question = ""
         reason = ""
@@ -189,15 +245,12 @@ class GladiatorLocalEnvironment(LocalEnvironment):
         }
 
     def _mentor_command(self, command: str, *, cwd: str) -> dict | None:
-        try:
-            args = shlex.split(command)
-        except ValueError:
+        parsed = self._reserved_command_args(command, "mentor")
+        if parsed is None:
             return None
-        pair_index = self._reserved_pair_index(args, "mentor")
-        if pair_index is None:
-            return None
-        if pair_index != 0:
-            return self._bad_mentor_command("gladiator mentor must be the sole command")
+        args, is_compound = parsed
+        if is_compound:
+            return self._bad_reserved_command("mentor")
         if len(args) < 4:
             return self._bad_mentor_command(
                 "Usage: gladiator mentor --question QUESTION [--file PATH ...] [--log PATH ...]"
@@ -258,12 +311,18 @@ class GladiatorLocalEnvironment(LocalEnvironment):
         return {"output": f"Invalid gladiator mentor command: {message}", "returncode": 2, "exception_info": "invalid mentor request"}
 
     def _web_command(self, command: str) -> dict | None:
-        try:
-            args = shlex.split(command)
-        except ValueError:
+        parsed = self._reserved_command_args(command, "web")
+        if parsed is None:
             return None
-        if len(args) < 4 or args[:2] != ["gladiator", "web"]:
-            return None
+        args, is_compound = parsed
+        if is_compound:
+            return self._bad_reserved_command("web")
+        if len(args) < 4:
+            return {
+                "output": "Usage: gladiator web search QUERY | gladiator web fetch URL",
+                "returncode": 2,
+                "exception_info": "invalid web command",
+            }
         if self.web_tools is None:
             return {"output": "Web tools are not configured.", "returncode": 2, "exception_info": "web disabled"}
         operation = args[2]
@@ -283,12 +342,18 @@ class GladiatorLocalEnvironment(LocalEnvironment):
         return {"output": output, "returncode": 0, "exception_info": ""}
 
     def _skill_command(self, command: str, *, cwd: str) -> dict | None:
-        try:
-            args = shlex.split(command)
-        except ValueError:
+        parsed = self._reserved_command_args(command, "skill")
+        if parsed is None:
             return None
-        if len(args) < 3 or args[:2] != ["gladiator", "skill"]:
-            return None
+        args, is_compound = parsed
+        if is_compound:
+            return self._bad_reserved_command("skill")
+        if len(args) < 3:
+            return {
+                "output": "Usage: gladiator skill list | read NAME | write NAME SOURCE_PATH | delete NAME",
+                "returncode": 2,
+                "exception_info": "invalid skill command",
+            }
         if self.skill_manager is None:
             return {"output": "Skills are unavailable.", "returncode": 2, "exception_info": "skills unavailable"}
         operation = args[2]
